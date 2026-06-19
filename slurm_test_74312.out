@@ -1,0 +1,82 @@
+=== Host: dalianvl01 | Arch: aarch64 | Date: Fri Jun 19 08:17:22 PM CEST 2026 ===
+=== GPU: NVIDIA GB200, 189471 MiB ===
+=== venv: /lustre/work/vivatech-4dudes/lmartinez/venvs/eb_jepa_aarch64 ===
+=== Python: Python 3.12.13 ===
+=== uv: uv 0.11.22 (aarch64-unknown-linux-gnu) ===
+>>> uv sync...
+>>> Running tests...
+============================= test session starts ==============================
+platform linux -- Python 3.12.13, pytest-9.1.1, pluggy-1.6.0 -- /lustre/work/vivatech-4dudes/lmartinez/venvs/eb_jepa_aarch64/bin/python
+cachedir: .pytest_cache
+rootdir: /lustre/work/vivatech-4dudes/lmartinez/eb_jepa
+configfile: pyproject.toml
+plugins: anyio-4.14.0
+collecting ... collected 21 items
+
+tests/planning_test.py::test_cem_planner PASSED                          [  4%]
+tests/planning_test.py::test_repr_target_dist_objective PASSED           [  9%]
+tests/planning_test.py::test_gc_agent PASSED                             [ 14%]
+tests/planning_test.py::test_main_eval PASSED                            [ 19%]
+tests/planning_test.py::test_planning_integration PASSED                 [ 23%]
+tests/test_jepa_output_formats.py::test_unroll_parallel_mode_output_format PASSED [ 28%]
+tests/test_jepa_output_formats.py::test_unroll_parallel_mode_with_loss PASSED [ 33%]
+tests/test_jepa_output_formats.py::test_infer_method PASSED              [ 38%]
+tests/test_jepa_output_formats.py::test_unroll_autoregressive_mode_shapes PASSED [ 42%]
+tests/test_jepa_output_formats.py::test_unroll_autoregressive_with_loss PASSED [ 47%]
+tests/test_jepa_output_formats.py::test_unroll_autoregressive_with_conv_predictor PASSED [ 52%]
+tests/test_jepa_output_formats.py::test_unroll_return_all_steps_format PASSED [ 57%]
+tests/test_loss_equivalences.py::TestStdLossEquivalence::test_vicreg_std_vs_hinge_std PASSED [ 61%]
+tests/test_loss_equivalences.py::TestStdLossEquivalence::test_centering_before_var_is_redundant PASSED [ 66%]
+tests/test_loss_equivalences.py::TestCovLossEquivalence::test_vicreg_cov_vs_covariance_loss PASSED [ 71%]
+tests/test_loss_equivalences.py::TestFullLossEquivalence::test_vicreg_decomposition PASSED [ 76%]
+tests/test_loss_equivalences.py::TestVCLoss::test_vc_loss_output_structure PASSED [ 80%]
+tests/test_loss_equivalences.py::TestVCLoss::test_vc_loss_with_projector PASSED [ 85%]
+tests/test_loss_equivalences.py::TestVCLoss::test_vc_loss_coefficient_weighting PASSED [ 90%]
+tests/test_loss_equivalences.py::TestVCLoss::test_vc_loss_consistency_across_seeds PASSED [ 95%]
+tests/test_loss_equivalences.py::TestVICRegLossRegression::test_refactored_vicreg_vs_original_implementation PASSED [100%]
+
+=============================== warnings summary ===============================
+tests/planning_test.py::test_main_eval
+tests/planning_test.py::test_main_eval
+  /lustre/work/vivatech-4dudes/lmartinez/venvs/eb_jepa_aarch64/lib/python3.12/site-packages/imageio/plugins/pillow.py:410: DeprecationWarning: The keyword `fps` is no longer supported. Use `duration`(in ms) instead, e.g. `fps=50` == `duration=20` (1000 * 1/50).
+    warnings.warn(
+
+tests/test_jepa_output_formats.py::test_unroll_parallel_mode_output_format
+  /lustre/work/vivatech-4dudes/lmartinez/venvs/eb_jepa_aarch64/lib/python3.12/site-packages/_pytest/python.py:171: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_jepa_output_formats.py::test_unroll_parallel_mode_output_format returned <class 'list'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+tests/test_jepa_output_formats.py::test_unroll_parallel_mode_with_loss
+  /lustre/work/vivatech-4dudes/lmartinez/venvs/eb_jepa_aarch64/lib/python3.12/site-packages/_pytest/python.py:171: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_jepa_output_formats.py::test_unroll_parallel_mode_with_loss returned <class 'tuple'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+tests/test_jepa_output_formats.py::test_unroll_autoregressive_mode_shapes
+  /lustre/work/vivatech-4dudes/lmartinez/venvs/eb_jepa_aarch64/lib/python3.12/site-packages/_pytest/python.py:171: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_jepa_output_formats.py::test_unroll_autoregressive_mode_shapes returned <class 'torch.Tensor'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+tests/test_jepa_output_formats.py::test_unroll_autoregressive_with_loss
+  /lustre/work/vivatech-4dudes/lmartinez/venvs/eb_jepa_aarch64/lib/python3.12/site-packages/_pytest/python.py:171: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_jepa_output_formats.py::test_unroll_autoregressive_with_loss returned <class 'tuple'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+tests/test_jepa_output_formats.py::test_unroll_autoregressive_with_conv_predictor
+  /lustre/work/vivatech-4dudes/lmartinez/venvs/eb_jepa_aarch64/lib/python3.12/site-packages/_pytest/python.py:171: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_jepa_output_formats.py::test_unroll_autoregressive_with_conv_predictor returned <class 'bool'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+tests/test_jepa_output_formats.py::test_unroll_return_all_steps_format
+  /lustre/work/vivatech-4dudes/lmartinez/venvs/eb_jepa_aarch64/lib/python3.12/site-packages/_pytest/python.py:171: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_jepa_output_formats.py::test_unroll_return_all_steps_format returned <class 'bool'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================= 21 passed, 8 warnings in 42.35s ========================
+=== Done ===
