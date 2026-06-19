@@ -17,6 +17,7 @@ authors = [
     {name = "Amir Bar", email = "amirbar@meta.com"},
 ]
 dependencies = [
+    "datasets>=5.0.0",
     "einops>=0.8.1",
     "fire>=0.7.0",
     "huggingface-hub>=0.33.2",
@@ -27,6 +28,7 @@ dependencies = [
     "tiktoken>=0.9.0",
     "torch>=2.7.0",
     "torchcodec>=0.4.0",
+    "torchaudio>=2.7.0",
     "torchvision",
     "wandb[media]>=0.21.1",
     "gymnasium>=1.1.1",
@@ -42,6 +44,9 @@ dependencies = [
 ]
 requires-python = "==3.12.*"
 
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
 # aarch64 compute nodes (GB200) need CUDA wheels from the PyTorch index
 [tool.uv.sources]
 torch = { index = "pytorch-cu128", marker = "platform_machine == 'aarch64'" }
@@ -50,6 +55,7 @@ torchvision = { index = "pytorch-cu128", marker = "platform_machine == 'aarch64'
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [build-system]
 requires = ["setuptools>=61.0"]

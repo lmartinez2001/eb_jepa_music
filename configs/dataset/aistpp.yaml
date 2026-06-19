@@ -1,0 +1,25 @@
+train_dataset:
+  _target_: eb_jepa.datasets.aistpp.aistpp.AISTPPClipDataset
+  split: train
+  dataset_name: haiphamcse/aistpp
+  num_frames: 12
+  image_size: [256, 144]  # width, height; set to null to keep original 512x288
+  include_audio_chunks: true
+  include_audio_spectrograms: true
+  audio_sample_rate: 48000
+  audio_n_fft: 1024
+  audio_hop_length: 256
+  audio_n_mels: 64
+
+val_dataset:
+  _target_: eb_jepa.datasets.aistpp.aistpp.AISTPPClipDataset
+  split: val
+  dataset_name: haiphamcse/aistpp
+  num_frames: 12
+  image_size: [256, 144]
+  include_audio_chunks: true
+  include_audio_spectrograms: true
+  audio_sample_rate: 48000
+  audio_n_fft: 1024
+  audio_hop_length: 256
+  audio_n_mels: 64
