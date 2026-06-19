@@ -1,0 +1,70 @@
+meta:
+  seed: 2025
+  device: auto
+  model_folder:
+  load_model: false
+  load_checkpoint: latest.pth.tar
+
+data:
+  # Replace with a callable that returns (train_loader, val_loader) or
+  # {"train": train_loader, "val": val_loader}.
+  loader: music.data.build_loaders
+  batch_size: 64
+  num_workers: 4
+  window: 243
+  horizon: 1
+
+model:
+  ema_momentum: 0.99
+
+  encoder:
+    dim_in: 3
+    dim_out: 3
+    dim_feat: 512
+    dim_rep: 512
+    depth: 5
+    num_heads: 8
+    mlp_ratio: 2
+    num_joints: 17
+    maxlen: 243
+    dropout: 0.0
+    attn_dropout: 0.0
+    drop_path: 0.0
+    att_fuse: true
+
+  music_encoder:
+    # By default music/main.py imports music.video_encoder.build_music_encoder.
+    # Set target to override, e.g. "my_pkg.my_module.build_music_encoder".
+    target:
+    dim: 768
+    freeze: true
+    precomputed: false
+    pool: mean
+
+  predictor:
+    num_layers: 1
+
+loss:
+  std_coeff: 10.0
+  cov_coeff: 1.0
+
+optim:
+  epochs: 50
+  lr: 1.0e-4
+  weight_decay: 1.0e-6
+  warmup_ratio: 0.1
+  grad_clip: 2.0
+
+training:
+  use_amp: true
+  dtype: float16
+
+logging:
+  project: eb_jepa
+  log_wandb: false
+  wandb_group:
+  wandb_sweep_id:
+  log_every: 100
+  val_every: 1
+  save_every: 10
+  tqdm_silent: false
