@@ -124,6 +124,11 @@ EXAMPLE_CONFIGS = {
         "module": "examples.ac_video_jepa.main",
         "metric": "success_rate",
     },
+    "music": {
+        "config": "music/cfgs/train.yaml",
+        "module": "music.main",
+        "metric": "val/score",
+    },
     # ---- ported PoC projects (self-contained: each has its own main.run) -------
     "fintime": {
         "config": "examples/fintime/cfgs/train.yaml",
@@ -450,7 +455,7 @@ if __name__ == "__main__":
         "--example",
         type=str,
         required=True,
-        choices=["image_jepa", "video_jepa", "ac_video_jepa", "maze",
+        choices=["image_jepa", "video_jepa", "ac_video_jepa", "maze", "music",
                  "fintime", "ltsf", "eeg", "audio", "pointcloud", "gray_scott",
                  "intuitive_physics","factors_of_variation"],
         help="Which example to run",

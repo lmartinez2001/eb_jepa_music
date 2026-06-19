@@ -340,6 +340,16 @@ def get_exp_name(example_name: str, cfg) -> str:
             f"_simt{cfg.model.regularizer.get('sim_coeff_t')}"
             f"_idm{cfg.model.regularizer.get('idm_coeff')}"
         )
+    elif example_name == "music":
+        return (
+            f"dst_f{cfg.model.encoder.dim_feat}"
+            f"_r{cfg.model.encoder.dim_rep}"
+            f"_d{cfg.model.encoder.depth}"
+            f"_h{cfg.data.horizon}"
+            f"_lr{cfg.optim.lr}"
+            f"_std{cfg.loss.std_coeff}"
+            f"_cov{cfg.loss.cov_coeff}"
+        )
     else:
         return "exp"
 

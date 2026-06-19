@@ -77,6 +77,11 @@ class AudioEncoder(nn.Module):
     def output_dim(self) -> int:
         return self._output_dim
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.muq.eval()
+        return self
+
     def _encode_chunks(self, chunks: torch.Tensor) -> torch.Tensor:
         """Run MuQ on a batch of audio chunks and return one vector per chunk.
 

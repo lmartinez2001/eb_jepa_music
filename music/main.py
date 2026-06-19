@@ -73,24 +73,29 @@ def build_dataloaders(cfg):
 
 
 def build_music_encoder(cfg):
-    """Build the music encoder from ``music.video_encoder``.
+    """Build the music/audio encoder.
 
-    By default this expects ``music/video_encoder.py`` to expose
-    ``build_music_encoder(cfg)``. Set ``model.music_encoder.target`` to use a
-    different callable.
+    By default this uses ``music.models.audio_encoder.AudioEncoder``. Set
+    ``model.music_encoder.target`` to point to a custom callable if needed.
     """
     music_cfg = cfg.model.get("music_encoder", {})
+    if music_cfg.get("precomputed", False):
+        return torch.nn.Identity()
+
     target = music_cfg.get("target")
     if target:
         return _call_builder(_import_symbol(target), music_cfg)
 
-    module = importlib.import_module("music.video_encoder")
-    if not hasattr(module, "build_music_encoder"):
-        raise AttributeError(
-            "music.video_encoder must define build_music_encoder(cfg), or set "
-            "model.music_encoder.target in the config"
-        )
-    return module.build_music_encoder(music_cfg)
+    from music.models.audio_encoder import AudioEncoder
+
+    return AudioEncoder(
+        model_name=music_cfg.get("model_name", "OpenMuQ/MuQ-large-msd-iter"),
+        embed_dim=music_cfg.get("dim", 384),
+        chunk_frames=music_cfg.get("chunk_frames", 150),
+        stride_frames=music_cfg.get("stride_frames", 15),
+        fps=music_cfg.get("fps", 30),
+        sample_rate=music_cfg.get("sample_rate", 24000),
+    )
 
 
 def build_keypoint_encoder(cfg):
@@ -161,7 +166,24 @@ def unpack_batch(batch, cfg):
     if music is None:
         raise KeyError("batch must contain music/audio/music_emb")
 
+    _validate_keypoint_window("x_t", x_t, cfg)
+    _validate_keypoint_window("x_next", x_next, cfg)
     return x_t, x_next, music
+
+
+def _validate_keypoint_window(name, x, cfg):
+    if x.ndim != 4:
+        raise ValueError(f"{name} must have shape [B, F, J, C], got {tuple(x.shape)}")
+    enc_cfg = cfg.model.encoder
+    expected_f = cfg.data.get("window", enc_cfg.get("maxlen", 243))
+    expected_j = enc_cfg.get("num_joints", 17)
+    expected_c = enc_cfg.get("dim_in", 3)
+    if x.shape[1] != expected_f:
+        raise ValueError(f"{name} frame dim must be {expected_f}, got {x.shape[1]}")
+    if x.shape[2] != expected_j:
+        raise ValueError(f"{name} joint dim must be {expected_j}, got {x.shape[2]}")
+    if x.shape[3] != expected_c:
+        raise ValueError(f"{name} channel dim must be {expected_c}, got {x.shape[3]}")
 
 
 def encode_music(music_encoder, music, cfg):
@@ -185,11 +207,21 @@ def encode_music(music_encoder, music, cfg):
             emb = emb.mean(dim=1)
         else:
             raise ValueError(f"Unknown music_encoder.pool={reduce}")
+    expected_dim = cfg.model.music_encoder.dim
+    if emb.ndim != 2:
+        raise ValueError(f"music embedding must have shape [B, M], got {tuple(emb.shape)}")
+    if emb.shape[-1] != expected_dim:
+        raise ValueError(
+            f"music embedding dim must match model.music_encoder.dim={expected_dim}, "
+            f"got {emb.shape[-1]}"
+        )
     return emb
 
 
 def cls_state(encoder, x):
     z = encoder(x, return_rep=True)
+    if z.ndim != 4:
+        raise ValueError(f"encoder representation must be [B, F, J+1, D], got {tuple(z.shape)}")
     return z[:, -1, 0]
 
 
@@ -289,6 +321,9 @@ def run(
         state_dim=cfg.model.encoder.get("dim_rep", 512),
         music_dim=cfg.model.music_encoder.dim,
         num_layers=cfg.model.predictor.get("num_layers", 1),
+        final_ln=torch.nn.LayerNorm(cfg.model.encoder.get("dim_rep", 512))
+        if cfg.model.predictor.get("final_ln", True)
+        else None,
     ).to(device)
 
     params = list(encoder.parameters()) + list(predictor.parameters())
@@ -486,7 +521,7 @@ def validate(loader, encoder, target_encoder, music_encoder, predictor, cfg, dev
         z_target = cls_state(target_encoder, x_next)
         losses.append(F.smooth_l1_loss(z_pred, z_target).item())
     mean_loss = sum(losses) / max(len(losses), 1)
-    return {"val/pred_loss": mean_loss}
+    return {"val/pred_loss": mean_loss, "val/score": -mean_loss}
 
 
 if __name__ == "__main__":

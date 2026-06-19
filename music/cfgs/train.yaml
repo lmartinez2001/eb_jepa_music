@@ -33,16 +33,24 @@ model:
     att_fuse: true
 
   music_encoder:
-    # By default music/main.py imports music.video_encoder.build_music_encoder.
+    # By default music/main.py uses music.models.audio_encoder.AudioEncoder.
     # Set target to override, e.g. "my_pkg.my_module.build_music_encoder".
     target:
-    dim: 768
-    freeze: true
+    model_name: OpenMuQ/MuQ-large-msd-iter
+    dim: 384
+    # MuQ itself is frozen inside AudioEncoder; false lets the small attention
+    # pooling/projection head train.
+    freeze: false
     precomputed: false
     pool: mean
+    chunk_frames: 150
+    stride_frames: 15
+    fps: 30
+    sample_rate: 24000
 
   predictor:
     num_layers: 1
+    final_ln: true
 
 loss:
   std_coeff: 10.0
@@ -68,3 +76,22 @@ logging:
   val_every: 1
   save_every: 10
   tqdm_silent: false
+
+# --- Parameters used when running with --full-sweep
+# Keep data.window and model.encoder.maxlen fixed together unless your launcher
+# supports tied parameters. Sweeping horizon changes prediction difficulty
+# without changing the MotionBERT tensor shape.
+sweep:
+  param_grid:
+    data.batch_size: [32, 64]
+    data.horizon: [1, 4, 8]
+    model.encoder.dim_feat: [256, 512]
+    model.encoder.dim_rep: [512]
+    model.encoder.depth: [5]
+    model.predictor.num_layers: [1]
+    model.ema_momentum: [0.99, 0.996]
+    loss.std_coeff: [4.0, 10.0]
+    loss.cov_coeff: [0.1, 1.0]
+    optim.lr: [0.00005, 0.0001, 0.0003]
+    optim.weight_decay: [0.000001]
+    meta.seed: [1, 1000, 10000]
