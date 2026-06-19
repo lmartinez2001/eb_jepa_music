@@ -6,13 +6,16 @@ meta:
   load_checkpoint: latest.pth.tar
 
 data:
-  # Replace with a callable that returns (train_loader, val_loader) or
-  # {"train": train_loader, "val": val_loader}.
-  loader: music.data.build_loaders
+  loader: music.datasets.aistpp_v2.build_loaders
   batch_size: 64
   num_workers: 4
-  window: 243
+  window: 120
   horizon: 1
+  data_root: /lustre/work/vivatech-4dudes/edugelay/datasets/aistpp_v2/data
+  fps: 30
+  sample_rate: 24000
+  audio_chunk_frames: 150
+  val_fraction: 0.1
 
 model:
   encoder:
@@ -23,8 +26,8 @@ model:
     depth: 5
     num_heads: 8
     mlp_ratio: 2
-    num_joints: 17
-    maxlen: 243
+    num_joints: 25
+    maxlen: 120
     dropout: 0.0
     attn_dropout: 0.0
     drop_path: 0.0
