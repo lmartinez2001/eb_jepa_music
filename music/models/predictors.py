@@ -1,3 +1,7 @@
-from music.models.predictor import MusicConditionedPredictor, MusicGRUPredictor
+from music.models.predictor import (
+    MusicConditionedPredictor,
+    MusicGRUPredictor,
+    MusicRNNPredictor,
+)
 
-__all__ = ["MusicConditionedPredictor", "MusicGRUPredictor"]
+__all__ = ["MusicRNNPredictor", "MusicGRUPredictor", "MusicConditionedPredictor"]
