@@ -7,6 +7,7 @@ from typing import Any
 import fire
 import torch
 import torch.nn.functional as F
+import wandb
 from omegaconf import OmegaConf
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
@@ -26,6 +27,7 @@ from eb_jepa.training_utils import (
     setup_seed,
     setup_wandb,
 )
+from music.models.audio_encoder import AudioEncoder
 from music.models.encoder import DSTformer
 from music.models.predictor import MusicRNNPredictor
 
@@ -38,11 +40,7 @@ def _import_symbol(path: str):
 
 
 def _call_builder(builder: Any, cfg):
-    cfg_dict = OmegaConf.to_container(cfg, resolve=True) if cfg is not None else {}
-    try:
-        return builder(**cfg_dict)
-    except TypeError:
-        return builder(cfg)
+    return builder(**OmegaConf.to_container(cfg, resolve=True))
 
 
 def build_dataloaders(cfg):
@@ -56,19 +54,8 @@ def build_dataloaders(cfg):
     The callable may return either ``(train_loader, val_loader)`` or a dict with
     ``train`` and optional ``val`` keys.
     """
-    if not cfg.data.get("loader"):
-        raise ValueError(
-            "cfg.data.loader must point to a callable returning train/val loaders"
-        )
-
     result = _call_builder(_import_symbol(cfg.data.loader), cfg.data)
-    if isinstance(result, dict):
-        return result["train"], result.get("val")
-    if isinstance(result, (tuple, list)) and len(result) in (1, 2):
-        train_loader = result[0]
-        val_loader = result[1] if len(result) == 2 else None
-        return train_loader, val_loader
-    raise ValueError("data.loader must return (train_loader, val_loader) or a dict")
+    return result["train"], result.get("val")
 
 
 def build_music_encoder(cfg):
@@ -78,92 +65,52 @@ def build_music_encoder(cfg):
     ``model.music_encoder.target`` to point to a custom callable if needed.
     """
     music_cfg = cfg.model.get("music_encoder", {})
-    if music_cfg.get("precomputed", False):
-        return torch.nn.Identity()
-
     target = music_cfg.get("target")
     if target:
         return _call_builder(_import_symbol(target), music_cfg)
 
-    from music.models.audio_encoder import AudioEncoder
-
     return AudioEncoder(
-        model_name=music_cfg.get("model_name", "OpenMuQ/MuQ-large-msd-iter"),
-        embed_dim=music_cfg.get("dim", 384),
-        chunk_frames=music_cfg.get("chunk_frames", 150),
-        stride_frames=music_cfg.get("stride_frames", 15),
-        fps=music_cfg.get("fps", 30),
-        sample_rate=music_cfg.get("sample_rate", 24000),
+        model_name=music_cfg.model_name,
+        embed_dim=music_cfg.dim,
+        chunk_frames=music_cfg.chunk_frames,
+        stride_frames=music_cfg.stride_frames,
+        fps=music_cfg.fps,
+        sample_rate=music_cfg.sample_rate,
     )
 
 
 def build_keypoint_encoder(cfg):
     enc_cfg = cfg.model.encoder
     return DSTformer(
-        dim_in=enc_cfg.get("dim_in", 3),
-        dim_out=enc_cfg.get("dim_out", 3),
-        dim_feat=enc_cfg.get("dim_feat", 512),
-        dim_rep=enc_cfg.get("dim_rep", 512),
-        depth=enc_cfg.get("depth", 5),
-        num_heads=enc_cfg.get("num_heads", 8),
-        mlp_ratio=enc_cfg.get("mlp_ratio", 2),
-        num_joints=enc_cfg.get("num_joints", 17),
-        maxlen=enc_cfg.get("maxlen", 243),
-        drop_rate=enc_cfg.get("dropout", 0.0),
-        attn_drop_rate=enc_cfg.get("attn_dropout", 0.0),
-        drop_path_rate=enc_cfg.get("drop_path", 0.0),
-        att_fuse=enc_cfg.get("att_fuse", True),
+        dim_in=enc_cfg.dim_in,
+        dim_out=enc_cfg.dim_out,
+        dim_feat=enc_cfg.dim_feat,
+        dim_rep=enc_cfg.dim_rep,
+        depth=enc_cfg.depth,
+        num_heads=enc_cfg.num_heads,
+        mlp_ratio=enc_cfg.mlp_ratio,
+        num_joints=enc_cfg.num_joints,
+        maxlen=enc_cfg.maxlen,
+        drop_rate=enc_cfg.dropout,
+        attn_drop_rate=enc_cfg.attn_dropout,
+        drop_path_rate=enc_cfg.drop_path,
+        att_fuse=enc_cfg.att_fuse,
     )
-
-
-def _get_first(batch, names):
-    for name in names:
-        if isinstance(batch, dict) and name in batch:
-            return batch[name]
-    return None
 
 
 def unpack_batch(batch, cfg):
     """Return ``x_t, x_next, music`` from a dance/music batch.
 
-    Supported batch formats:
-    - dict with ``x_t``/``x_next`` and ``music`` or ``music_emb``
-    - dict with ``keypoints`` sequence ``[B, T, J, C]`` plus music
-    - tuple/list ``(keypoints, music, ...)``
-
-    If only a keypoint sequence is provided, the two MotionBERT windows are:
+    Expected batch keys are ``keypoints`` and ``music``. The two MotionBERT
+    windows are:
     ``keypoints[:, :F]`` and ``keypoints[:, horizon:horizon+F]``.
     """
-    if isinstance(batch, (tuple, list)):
-        keypoints = batch[0]
-        music = batch[1]
-        batch = {"keypoints": keypoints, "music": music}
-
-    if not isinstance(batch, dict):
-        raise TypeError("batch must be a dict or a tuple/list")
-
-    x_t = _get_first(batch, ("x_t", "state", "current", "keypoints_t"))
-    x_next = _get_first(batch, ("x_next", "next_state", "target", "keypoints_next"))
-    music = _get_first(batch, ("music_emb", "music_embedding", "music", "audio"))
-
-    if x_t is None or x_next is None:
-        keypoints = _get_first(batch, ("keypoints", "poses", "dance", "x"))
-        if keypoints is None:
-            raise KeyError(
-                "batch must contain x_t/x_next or a keypoints sequence"
-            )
-        window = cfg.data.get("window", cfg.model.encoder.get("maxlen", 243))
-        horizon = cfg.data.get("horizon", 1)
-        if keypoints.shape[1] < window + horizon:
-            raise ValueError(
-                f"keypoints needs at least window+horizon frames "
-                f"({window + horizon}), got {keypoints.shape[1]}"
-            )
-        x_t = keypoints[:, :window]
-        x_next = keypoints[:, horizon : horizon + window]
-
-    if music is None:
-        raise KeyError("batch must contain music/audio/music_emb")
+    keypoints = batch["keypoints"]
+    music = batch["music"]
+    window = cfg.data.window
+    horizon = cfg.data.horizon
+    x_t = keypoints[:, :window]
+    x_next = keypoints[:, horizon : horizon + window]
 
     _validate_keypoint_window("x_t", x_t, cfg)
     _validate_keypoint_window("x_next", x_next, cfg)
@@ -174,9 +121,9 @@ def _validate_keypoint_window(name, x, cfg):
     if x.ndim != 4:
         raise ValueError(f"{name} must have shape [B, F, J, C], got {tuple(x.shape)}")
     enc_cfg = cfg.model.encoder
-    expected_f = cfg.data.get("window", enc_cfg.get("maxlen", 243))
-    expected_j = enc_cfg.get("num_joints", 17)
-    expected_c = enc_cfg.get("dim_in", 3)
+    expected_f = cfg.data.window
+    expected_j = enc_cfg.num_joints
+    expected_c = enc_cfg.dim_in
     if x.shape[1] != expected_f:
         raise ValueError(f"{name} frame dim must be {expected_f}, got {x.shape[1]}")
     if x.shape[2] != expected_j:
@@ -186,26 +133,14 @@ def _validate_keypoint_window(name, x, cfg):
 
 
 def encode_music(music_encoder, music, cfg):
-    if cfg.model.get("music_encoder", {}).get("precomputed", False):
-        emb = music
-    else:
-        emb = music_encoder(music)
-
-    if isinstance(emb, (tuple, list)):
-        emb = emb[0]
-    if isinstance(emb, dict):
-        emb = emb.get("embedding", emb.get("embeddings", emb.get("last_hidden_state")))
-    if emb is None:
-        raise ValueError("music encoder returned no usable embedding")
+    emb = music_encoder(music)
 
     if emb.ndim == 3:
-        reduce = cfg.model.get("music_encoder", {}).get("pool", "mean")
+        reduce = cfg.model.music_encoder.pool
         if reduce == "last":
             emb = emb[:, -1]
-        elif reduce == "mean":
-            emb = emb.mean(dim=1)
         else:
-            raise ValueError(f"Unknown music_encoder.pool={reduce}")
+            emb = emb.mean(dim=1)
     expected_dim = cfg.model.music_encoder.dim
     if emb.ndim != 2:
         raise ValueError(f"music embedding must have shape [B, M], got {tuple(emb.shape)}")
@@ -308,11 +243,11 @@ def run(
             p.requires_grad_(False)
 
     predictor = MusicRNNPredictor(
-        state_dim=cfg.model.encoder.get("dim_rep", 512),
+        state_dim=cfg.model.encoder.dim_rep,
         music_dim=cfg.model.music_encoder.dim,
-        num_layers=cfg.model.predictor.get("num_layers", 1),
-        final_ln=torch.nn.LayerNorm(cfg.model.encoder.get("dim_rep", 512))
-        if cfg.model.predictor.get("final_ln", True)
+        num_layers=cfg.model.predictor.num_layers,
+        final_ln=torch.nn.LayerNorm(cfg.model.encoder.dim_rep)
+        if cfg.model.predictor.final_ln
         else None,
     ).to(device)
 
@@ -427,8 +362,6 @@ def run(
             )
 
             if wandb_run and global_step % cfg.logging.get("log_every", 100) == 0:
-                import wandb
-
                 wandb.log(
                     {f"train/{k}": float(v) for k, v in last_logs.items()}
                     | {"global_step": global_step},
@@ -439,8 +372,6 @@ def run(
         if val_loader is not None and epoch % cfg.logging.get("val_every", 1) == 0:
             val_logs = validate(val_loader, encoder, music_encoder, predictor, cfg, device)
             if wandb_run:
-                import wandb
-
                 wandb.log(val_logs | {"global_step": global_step}, step=global_step)
 
         log_epoch(

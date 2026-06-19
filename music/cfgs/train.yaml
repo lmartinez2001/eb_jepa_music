@@ -39,7 +39,6 @@ model:
     # MuQ itself is frozen inside AudioEncoder; false lets the small attention
     # pooling/projection head train.
     freeze: false
-    precomputed: false
     pool: mean
     chunk_frames: 150
     stride_frames: 15
