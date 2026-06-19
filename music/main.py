@@ -235,12 +235,7 @@ def run(
     logger.info(f"Saved complete config to {config_path}")
 
     encoder = build_keypoint_encoder(cfg).to(device)
-
     music_encoder = build_music_encoder(cfg).to(device)
-    if cfg.model.get("music_encoder", {}).get("freeze", True):
-        music_encoder.eval()
-        for p in music_encoder.parameters():
-            p.requires_grad_(False)
 
     predictor = MusicRNNPredictor(
         state_dim=cfg.model.encoder.dim_rep,
@@ -253,7 +248,7 @@ def run(
 
     params = list(encoder.parameters()) + list(predictor.parameters())
     if not cfg.model.get("music_encoder", {}).get("freeze", True):
-        params += list(music_encoder.parameters())
+        params += [p for p in music_encoder.parameters() if p.requires_grad]
 
     optimizer = AdamW(
         params,
