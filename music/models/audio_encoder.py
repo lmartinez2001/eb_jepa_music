@@ -54,6 +54,7 @@ class AudioEncoder(nn.Module):
         stride_frames: int = 15,
         fps: int = 30,
         sample_rate: int = _MUQ_SAMPLE_RATE,
+        use_attn_pool: bool = True,
     ):
         super().__init__()
 
@@ -61,6 +62,7 @@ class AudioEncoder(nn.Module):
         samples_per_frame = sample_rate // fps
         self.chunk_samples = chunk_frames * samples_per_frame
         self.stride_samples = stride_frames * samples_per_frame
+        self.use_attn_pool = use_attn_pool
 
         # Load and freeze MuQ, caching weights in pretrained/
         self.muq: MuQ = MuQ.from_pretrained(model_name, cache_dir=_PRETRAINED_DIR)
@@ -70,7 +72,7 @@ class AudioEncoder(nn.Module):
 
         hidden_size = self.muq.config.encoder_dim
         out_dim = embed_dim if embed_dim is not None else hidden_size
-        self.attn_pool = AttentionPooling(hidden_size, out_dim)
+        self.attn_pool = AttentionPooling(hidden_size, out_dim) if use_attn_pool else nn.Linear(hidden_size, out_dim)
         self._output_dim = out_dim
 
     @property
@@ -94,7 +96,11 @@ class AudioEncoder(nn.Module):
         with torch.no_grad():
             out = self.muq(chunks)
 
-        return self.attn_pool(out.last_hidden_state)  # [M, out_dim]
+        if self.use_attn_pool:
+            return self.attn_pool(out.last_hidden_state)  # [M, out_dim]
+        else:
+            return self.attn_pool(out.last_hidden_state.mean(dim=1))  # [M, out_dim]
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
