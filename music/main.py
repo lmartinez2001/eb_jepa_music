@@ -73,7 +73,6 @@ def build_music_encoder(cfg):
         model_name=music_cfg.model_name,
         embed_dim=music_cfg.dim,
         chunk_frames=music_cfg.chunk_frames,
-        stride_frames=music_cfg.stride_frames,
         fps=music_cfg.fps,
         sample_rate=music_cfg.sample_rate,
     )
