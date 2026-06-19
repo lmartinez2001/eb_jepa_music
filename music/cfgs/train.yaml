@@ -15,8 +15,6 @@ data:
   horizon: 1
 
 model:
-  ema_momentum: 0.99
-
   encoder:
     dim_in: 3
     dim_out: 3
@@ -89,7 +87,6 @@ sweep:
     model.encoder.dim_rep: [512]
     model.encoder.depth: [5]
     model.predictor.num_layers: [1]
-    model.ema_momentum: [0.99, 0.996]
     loss.std_coeff: [4.0, 10.0]
     loss.cov_coeff: [0.1, 1.0]
     optim.lr: [0.00005, 0.0001, 0.0003]

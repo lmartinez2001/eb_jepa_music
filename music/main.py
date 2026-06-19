@@ -1,4 +1,3 @@
-import copy
 import importlib
 import os
 from pathlib import Path
@@ -242,12 +241,6 @@ def variance_covariance_loss(z, std_coeff=0.0, cov_coeff=0.0, eps=1e-4):
     return loss, {"std_loss": std_loss.detach(), "cov_loss": cov_loss.detach()}
 
 
-@torch.no_grad()
-def update_ema(target, online, momentum):
-    for target_param, online_param in zip(target.parameters(), online.parameters()):
-        target_param.mul_(momentum).add_(online_param.detach(), alpha=1.0 - momentum)
-
-
 def run(
     fname: str = "music/cfgs/train.yaml",
     cfg=None,
@@ -256,9 +249,9 @@ def run(
 ):
     """Train a music-conditioned JEPA on dance keypoint windows.
 
-    The model predicts the target encoder's next-window CLS latent:
+    The model predicts the stop-gradient next-window CLS latent:
 
-    ``DSTformer(x_t)[:, -1, 0] + music_embedding -> DSTformer_target(x_t+1)[:, -1, 0]``.
+    ``DSTformer(x_t)[:, -1, 0] + music_embedding -> stopgrad(DSTformer(x_t+1)[:, -1, 0])``.
     """
     if cfg is None:
         cfg = load_config(fname, overrides if overrides else None)
@@ -307,9 +300,6 @@ def run(
     logger.info(f"Saved complete config to {config_path}")
 
     encoder = build_keypoint_encoder(cfg).to(device)
-    target_encoder = copy.deepcopy(encoder).to(device)
-    for p in target_encoder.parameters():
-        p.requires_grad_(False)
 
     music_encoder = build_music_encoder(cfg).to(device)
     if cfg.model.get("music_encoder", {}).get("freeze", True):
@@ -345,7 +335,6 @@ def run(
         predictor,
         {
             "encoder": sum(p.numel() for p in encoder.parameters()),
-            "target_encoder": sum(p.numel() for p in target_encoder.parameters()),
             "music_encoder": sum(p.numel() for p in music_encoder.parameters()),
             "predictor": sum(p.numel() for p in predictor.parameters()),
         },
@@ -366,7 +355,6 @@ def run(
             weights_only=False,
         )
         encoder.load_state_dict(checkpoint["encoder"])
-        target_encoder.load_state_dict(checkpoint["target_encoder"])
         predictor.load_state_dict(checkpoint["predictor"])
         if "music_encoder" in checkpoint:
             music_encoder.load_state_dict(checkpoint["music_encoder"])
@@ -376,7 +364,6 @@ def run(
         global_step = checkpoint.get("step", 0)
 
     latest_ckpt_path = folder / "latest.pth.tar"
-    ema_momentum = cfg.model.get("ema_momentum", 0.99)
 
     for epoch in range(start_epoch, cfg.optim.epochs):
         epoch_start = time()
@@ -406,7 +393,7 @@ def run(
                 z_pred = predictor(z_t, music_emb)
 
                 with torch.no_grad():
-                    z_target = cls_state(target_encoder, x_next)
+                    z_target = cls_state(encoder, x_next)
 
                 pred_loss = F.smooth_l1_loss(z_pred, z_target)
                 vc_loss, vc_logs = variance_covariance_loss(
@@ -423,7 +410,6 @@ def run(
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
-            update_ema(target_encoder, encoder, ema_momentum)
 
             global_step += 1
             last_logs = {
@@ -451,7 +437,7 @@ def run(
 
         val_logs = {}
         if val_loader is not None and epoch % cfg.logging.get("val_every", 1) == 0:
-            val_logs = validate(val_loader, encoder, target_encoder, music_encoder, predictor, cfg, device)
+            val_logs = validate(val_loader, encoder, music_encoder, predictor, cfg, device)
             if wandb_run:
                 import wandb
 
@@ -471,7 +457,6 @@ def run(
         torch.save(
             {
                 "encoder": encoder.state_dict(),
-                "target_encoder": target_encoder.state_dict(),
                 "music_encoder": music_encoder.state_dict(),
                 "predictor": predictor.state_dict(),
                 "optimizer": optimizer.state_dict(),
@@ -485,7 +470,6 @@ def run(
             torch.save(
                 {
                     "encoder": encoder.state_dict(),
-                    "target_encoder": target_encoder.state_dict(),
                     "music_encoder": music_encoder.state_dict(),
                     "predictor": predictor.state_dict(),
                     "optimizer": optimizer.state_dict(),
@@ -504,9 +488,8 @@ def run(
 
 
 @torch.no_grad()
-def validate(loader, encoder, target_encoder, music_encoder, predictor, cfg, device):
+def validate(loader, encoder, music_encoder, predictor, cfg, device):
     encoder.eval()
-    target_encoder.eval()
     music_encoder.eval()
     predictor.eval()
     losses = []
@@ -518,7 +501,7 @@ def validate(loader, encoder, target_encoder, music_encoder, predictor, cfg, dev
         z_t = cls_state(encoder, x_t)
         music_emb = encode_music(music_encoder, music, cfg)
         z_pred = predictor(z_t, music_emb)
-        z_target = cls_state(target_encoder, x_next)
+        z_target = cls_state(encoder, x_next)
         losses.append(F.smooth_l1_loss(z_pred, z_target).item())
     mean_loss = sum(losses) / max(len(losses), 1)
     return {"val/pred_loss": mean_loss, "val/score": -mean_loss}
