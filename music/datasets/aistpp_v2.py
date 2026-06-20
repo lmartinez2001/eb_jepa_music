@@ -66,6 +66,7 @@ class AISTPPV2Dataset(Dataset):
         clips: list,
         window: int = 120,
         horizon: int = 1,
+        stride: int | None = None,
         fps: int = 30,
         target_sr: int = 24_000,
         audio_chunk_frames: int = 150,
@@ -76,10 +77,11 @@ class AISTPPV2Dataset(Dataset):
         self.samples_per_frame = target_sr // fps
         self.audio_chunk_samples = audio_chunk_frames * self.samples_per_frame
         self.kp_len = window + horizon
+        _stride = stride if stride is not None else window  # non-overlapping by default
 
         self._index: list[tuple[int, int]] = []
         for i, c in enumerate(clips):
-            for start in range(c["n_frames"] - self.kp_len + 1):
+            for start in range(0, c["n_frames"] - self.kp_len + 1, _stride):
                 self._index.append((i, start))
 
     def __len__(self) -> int:
@@ -94,14 +96,13 @@ class AISTPPV2Dataset(Dataset):
         trans = clip["trans"][start : start + self.kp_len]
         kp = np.concatenate([poses.reshape(-1, 24, 3), trans[:, None, :]], axis=1)
 
-        # audio chunk aligned to window start, padded with silence if near clip end
-        s0 = start * self.samples_per_frame
-        s1 = s0 + self.audio_chunk_samples
+        # audio ends at the same frame as x_next, extends audio_chunk_frames backward
         full = clip["audio"]  # [1, clip_samples]
-        if s1 <= full.shape[1]:
-            music = full[:, s0:s1]
-        else:
-            music = F.pad(full[:, s0:], (0, s1 - full.shape[1]))
+        s1 = (start + self.kp_len) * self.samples_per_frame
+        s0 = s1 - self.audio_chunk_samples
+        left_pad  = max(0, -s0)
+        right_pad = max(0, s1 - full.shape[1])
+        music = F.pad(full[:, max(0, s0) : min(s1, full.shape[1])], (left_pad, right_pad))
 
         return {
             "keypoints": torch.from_numpy(kp),  # [kp_len, 25, 3]
@@ -114,6 +115,7 @@ def build_loaders(
     num_workers: int = 4,
     window: int = 120,
     horizon: int = 1,
+    stride: int | None = None,
     data_root: str = _DEFAULT_DATA_ROOT,
     val_fraction: float = 0.1,
     fps: int = 30,
@@ -124,7 +126,7 @@ def build_loaders(
     clips = _load_clips(Path(data_root), target_sr=sample_rate, fps=fps)
     n_val = max(1, round(len(clips) * val_fraction))
 
-    common = dict(window=window, horizon=horizon, fps=fps, target_sr=sample_rate, audio_chunk_frames=audio_chunk_frames)
+    common = dict(window=window, horizon=horizon, stride=stride, fps=fps, target_sr=sample_rate, audio_chunk_frames=audio_chunk_frames)
     train_ds = AISTPPV2Dataset(clips[n_val:], **common)
     val_ds   = AISTPPV2Dataset(clips[:n_val], **common)
 
