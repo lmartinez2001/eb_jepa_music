@@ -426,10 +426,10 @@ def validate(loader, encoder, music_encoder, predictor, cfg, device):
         z_t = cls_state(encoder, x_t)
         music_emb = encode_music(music_encoder, music, cfg)
         z_pred = predictor(z_t, music_emb)
-        z_target = cls_state(encoder, x_next)
-        losses.append(F.smooth_l1_loss(z_pred, z_target).item())
+    z_target = cls_state(encoder, x_next)
+    losses.append(F.smooth_l1_loss(z_pred, z_target).item())
     mean_loss = sum(losses) / max(len(losses), 1)
-    return {"val/pred_loss": mean_loss, "val/score": -mean_loss}
+    return {"val/pred_loss": mean_loss}
 
 
 if __name__ == "__main__":

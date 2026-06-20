@@ -127,7 +127,8 @@ EXAMPLE_CONFIGS = {
     "music": {
         "config": "music/cfgs/train.yaml",
         "module": "music.main",
-        "metric": "val/score",
+        "metric": "val/pred_loss",
+        "metric_goal": "minimize",
     },
     # ---- ported PoC projects (self-contained: each has its own main.run) -------
     "fintime": {
@@ -350,11 +351,16 @@ def launch_job(example_name: str, fname: str, **kwargs):
     return job
 
 
-def create_wandb_sweep_config(param_grid: dict, metric: str, method: str = "grid"):
+def create_wandb_sweep_config(
+    param_grid: dict,
+    metric: str,
+    method: str = "grid",
+    metric_goal: str = "maximize",
+):
     """Create a wandb sweep configuration from a parameter grid."""
     sweep_config = {
         "method": method,
-        "metric": {"goal": "maximize", "name": metric},
+        "metric": {"goal": metric_goal, "name": metric},
         "parameters": {},
     }
 
@@ -390,7 +396,13 @@ def launch_sweep(
     if use_wandb:
         project_name = "eb_jepa"
         metric = EXAMPLE_CONFIGS[example_name]["metric"]
-        sweep_config = create_wandb_sweep_config(param_grid, metric, wandb_method)
+        metric_goal = EXAMPLE_CONFIGS[example_name].get("metric_goal", "maximize")
+        sweep_config = create_wandb_sweep_config(
+            param_grid,
+            metric,
+            wandb_method,
+            metric_goal,
+        )
         sweep_id = wandb.sweep(sweep_config, project=project_name)
         print(f"Created wandb sweep with ID: {sweep_id}")
         print(

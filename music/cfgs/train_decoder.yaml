@@ -1,0 +1,58 @@
+meta:
+  seed: 2025
+  device: auto
+  model_folder:
+  load_model: false
+  load_checkpoint: latest.pth.tar
+
+data:
+  # Not implemented yet. This callable should return {"train": ..., "val": ...}.
+  # Each batch must contain:
+  #   poses:     [B, F, J, 3]
+  #   embedding: [B, cond_dim]
+  loader: music.datasets.decoder_dataset.build_loaders
+  cache_dir: data/music_decoder_cache
+  batch_size: 64
+  num_workers: 4
+
+model:
+  decoder:
+    num_frames: 120
+    num_joints: 25
+    cond_dim: 512
+    dim: 512
+    depth: 6
+    num_heads: 8
+    mlp_ratio: 4.0
+    t_dim: 256
+
+optim:
+  epochs: 100
+  lr: 0.0001
+  weight_decay: 0.000001
+  warmup_ratio: 0.1
+  grad_clip: 2.0
+
+training:
+  use_amp: true
+  dtype: float16
+
+logging:
+  project: eb_jepa
+  log_wandb: false
+  wandb_group:
+  wandb_sweep_id:
+  log_every: 100
+  val_every: 1
+  save_every: 10
+  tqdm_silent: false
+
+sweep:
+  param_grid:
+    data.batch_size: [32, 64]
+    model.decoder.dim: [384, 512]
+    model.decoder.depth: [4, 6, 8]
+    model.decoder.num_heads: [6, 8]
+    optim.lr: [0.00005, 0.0001, 0.0003]
+    optim.weight_decay: [0.000001, 0.00001]
+    meta.seed: [1, 1000, 10000]
