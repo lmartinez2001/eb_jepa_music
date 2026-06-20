@@ -40,6 +40,7 @@ from eb_jepa.training_utils import (
 from music.models.audio_encoder import AudioEncoder
 from music.models.encoder import DSTformer
 from music.models.predictor import MusicRNNPredictor
+from music.models.transformer_predictor import MusicTransformerPredictor
 
 logger = get_logger(__name__)
 
@@ -81,7 +82,6 @@ def build_music_encoder(cfg):
 
     return AudioEncoder(
         model_name=music_cfg.model_name,
-        embed_dim=music_cfg.dim,
         chunk_frames=music_cfg.chunk_frames,
         fps=music_cfg.fps,
         sample_rate=music_cfg.sample_rate,
@@ -108,57 +108,57 @@ def build_keypoint_encoder(cfg):
 
 
 def unpack_batch(batch, cfg):
-    """Return ``x_t, x_next, music`` from a dance/music batch.
+    """Return ``(x_t, x_futures, music)`` from a dance/music batch.
 
-    Expected batch keys are ``keypoints`` and ``music``. The two MotionBERT
-    windows are:
-    ``keypoints[:, :F]`` and ``keypoints[:, horizon:horizon+F]``.
+    x_t       : [B, window, J, C]
+    x_futures : [B, pred_horizon, window, J, C]  — H future windows for teacher forcing
+    music     : [B, pred_horizon, chunk_samples]  — one audio chunk per future step
     """
-    keypoints = batch["keypoints"]
-    music = batch["music"]
-    window = cfg.data.window
-    horizon = cfg.data.horizon
+    keypoints = batch["keypoints"]          # [B, kp_len, J, C]
+    music     = batch["music"]              # [B, pred_horizon, chunk_samples]
+    window    = cfg.data.window
+    horizon   = cfg.data.horizon
+    H         = cfg.data.get("pred_horizon", 1)
+
     x_t = keypoints[:, :window]
-    x_next = keypoints[:, horizon : horizon + window]
+    x_futures = torch.stack(
+        [keypoints[:, (h + 1) * horizon : (h + 1) * horizon + window] for h in range(H)],
+        dim=1,
+    )  # [B, H, window, J, C]
 
-    _validate_keypoint_window("x_t", x_t, cfg)
-    _validate_keypoint_window("x_next", x_next, cfg)
-    return x_t, x_next, music
+    _validate_keypoint_window(x_t, cfg)
+    return x_t, x_futures, music
 
 
-def _validate_keypoint_window(name, x, cfg):
-    if x.ndim != 4:
-        raise ValueError(f"{name} must have shape [B, F, J, C], got {tuple(x.shape)}")
+def _validate_keypoint_window(x, cfg):
     enc_cfg = cfg.model.encoder
-    expected_f = cfg.data.window
-    expected_j = enc_cfg.num_joints
-    expected_c = enc_cfg.dim_in
-    if x.shape[1] != expected_f:
-        raise ValueError(f"{name} frame dim must be {expected_f}, got {x.shape[1]}")
-    if x.shape[2] != expected_j:
-        raise ValueError(f"{name} joint dim must be {expected_j}, got {x.shape[2]}")
-    if x.shape[3] != expected_c:
-        raise ValueError(f"{name} channel dim must be {expected_c}, got {x.shape[3]}")
+    if x.ndim != 4:
+        raise ValueError(f"keypoint window must be [B, F, J, C], got {tuple(x.shape)}")
+    if x.shape[1] != cfg.data.window:
+        raise ValueError(f"frame dim must be {cfg.data.window}, got {x.shape[1]}")
+    if x.shape[2] != enc_cfg.num_joints:
+        raise ValueError(f"joint dim must be {enc_cfg.num_joints}, got {x.shape[2]}")
+    if x.shape[3] != enc_cfg.dim_in:
+        raise ValueError(f"channel dim must be {enc_cfg.dim_in}, got {x.shape[3]}")
 
 
-def encode_music(music_encoder, music, cfg):
-    emb = music_encoder(music)
+def encode_music(music_encoder, music, cfg, chunk_size: int = 64):
+    """Encode music waveforms to frame-level MuQ sequences.
 
-    if emb.ndim == 3:
-        reduce = cfg.model.music_encoder.pool
-        if reduce == "last":
-            emb = emb[:, -1]
-        else:
-            emb = emb.mean(dim=1)
-    expected_dim = cfg.model.music_encoder.dim
-    if emb.ndim != 2:
-        raise ValueError(f"music embedding must have shape [B, M], got {tuple(emb.shape)}")
-    if emb.shape[-1] != expected_dim:
-        raise ValueError(
-            f"music embedding dim must match model.music_encoder.dim={expected_dim}, "
-            f"got {emb.shape[-1]}"
-        )
-    return emb
+    Args:
+        music: [B, H, chunk_samples] — H chunks per sample (pred_horizon steps).
+        chunk_size: max clips per MuQ forward pass to avoid GPU OOM.
+
+    Returns:
+        [B, H, T, muq_hidden] — full MuQ sequence per chunk, one per future step.
+    """
+    B, H, S = music.shape
+    flat = music.reshape(B * H, 1, S)  # [B*H, 1, chunk_samples]
+    parts = []
+    for i in range(0, flat.shape[0], chunk_size):
+        parts.append(music_encoder(flat[i : i + chunk_size]))
+    emb = torch.cat(parts, dim=0)            # [B*H, T, muq_hidden]
+    return emb.reshape(B, H, emb.shape[1], emb.shape[2])  # [B, H, T, muq_hidden]
 
 
 def cls_state(encoder, x):
@@ -199,7 +199,7 @@ def monitor_collapse(loader, encoder, cfg, device, folder: Path, epoch: int, wan
         x_t = x_t.to(device, non_blocking=True)
         z = cls_state(encoder, x_t).float().cpu()
         zs.append(z)
-        if len(zs) * z.shape[0] >= 2048:  # cap at 2048 samples for speed
+        if sum(t.shape[0] for t in zs) >= 2048:  # cap at 2048 samples for speed
             break
     Z = torch.cat(zs, dim=0).numpy()  # [N, D]
     Zc = Z - Z.mean(0)                # centred
@@ -357,14 +357,27 @@ def run(
         lmbd=cfg.loss.get("bcs_coeff", 10.0),
     ).to(device)
 
-    predictor = MusicRNNPredictor(
-        state_dim=cfg.model.encoder.dim_rep,
-        music_dim=cfg.model.music_encoder.dim,
-        num_layers=cfg.model.predictor.num_layers,
-        final_ln=torch.nn.LayerNorm(cfg.model.encoder.dim_rep)
-        if cfg.model.predictor.final_ln
-        else None,
-    ).to(device)
+    _pred_cfg = cfg.model.predictor
+    _final_ln = torch.nn.LayerNorm(cfg.model.encoder.dim_rep) if _pred_cfg.final_ln else None
+    if _pred_cfg.get("target", "rnn") == "transformer":
+        predictor = MusicTransformerPredictor(
+            state_dim=cfg.model.encoder.dim_rep,
+            music_dim=music_encoder.output_dim,
+            horizon=_pred_cfg.get("horizon", 1),
+            dim=_pred_cfg.get("dim", 512),
+            num_layers=_pred_cfg.num_layers,
+            num_heads=_pred_cfg.get("num_heads", 8),
+            ff_mult=_pred_cfg.get("ff_mult", 4),
+            dropout=_pred_cfg.get("dropout", 0.0),
+            final_ln=_final_ln,
+        ).to(device)
+    else:
+        predictor = MusicRNNPredictor(
+            state_dim=cfg.model.encoder.dim_rep,
+            music_dim=cfg.model.music_encoder.dim,
+            num_layers=_pred_cfg.num_layers,
+            final_ln=_final_ln,
+        ).to(device)
 
     params = list(encoder.parameters()) + list(predictor.parameters())
     if not cfg.model.get("music_encoder", {}).get("freeze", True):
@@ -400,7 +413,7 @@ def run(
     global_step = 0
     if cfg.meta.get("load_model", False):
         checkpoint = torch.load(
-            folder / cfg.meta.get("load_checkpoint", "latest.pth.tar"),
+            save_dir / cfg.meta.get("load_checkpoint", "latest.pth.tar"),
             map_location=device,
             weights_only=False,
         )
@@ -431,31 +444,47 @@ def run(
             desc=f"Epoch {epoch}/{cfg.optim.epochs - 1}",
             disable=cfg.logging.get("tqdm_silent", False),
         )
+        H = cfg.data.get("pred_horizon", 1)
         last_logs = {}
         for batch in pbar:
-            x_t, x_next, music = unpack_batch(batch, cfg)
-            x_t = x_t.to(device, non_blocking=True)
-            x_next = x_next.to(device, non_blocking=True)
-            music = music.to(device, non_blocking=True)
+            x_t, x_futures, music = unpack_batch(batch, cfg)
+            x_t      = x_t.to(device, non_blocking=True)       # [B, F, J, C]
+            x_futures = x_futures.to(device, non_blocking=True) # [B, H, F, J, C]
+            music    = music.to(device, non_blocking=True)      # [B, H, chunk_samples]
 
             optimizer.zero_grad(set_to_none=True)
             with autocast(device.type, enabled=use_amp, dtype=dtype):
-                z_t = cls_state(encoder, x_t)
-                music_emb = encode_music(music_encoder, music, cfg)
-                z_pred = predictor(z_t, music_emb)
+                z_t       = cls_state(encoder, x_t)            # [B, D]
+                music_emb = encode_music(music_encoder, music, cfg)  # [B, H, M]
 
                 with torch.no_grad():
-                    z_target = cls_state(encoder, x_next)
+                    z_targets = torch.stack(
+                        [cls_state(encoder, x_futures[:, h]) for h in range(H)], dim=1
+                    )  # [B, H, D]
 
-                pred_loss = F.smooth_l1_loss(z_pred, z_target)
+                # Teacher-forcing: state_seq = [z_t, z_{t+1}, ..., z_{t+H-1}]
+                state_seq = torch.cat([z_t.unsqueeze(1), z_targets[:, :-1]], dim=1)  # [B, H, D]
+                if getattr(predictor, "is_rnn", False):
+                    z_pred = torch.stack(
+                        [predictor(state_seq[:, h], music_emb[:, h]) for h in range(H)], dim=1
+                    )  # [B, H, D]
+                else:
+                    z_pred = predictor(state_seq, music_emb)   # [B, H, D]
+
+                pred_loss = F.smooth_l1_loss(z_pred, z_targets)
+
+                # Regularise on z_t and all H targets (flattened to [(1+H)*B, D])
+                reg_input = torch.cat(
+                    [z_t, z_targets.flatten(0, 1)], dim=0
+                ).float()
                 loss_type = cfg.loss.get("type", "vicreg")
                 if loss_type == "sigreg":
-                    bcs_out = bcs(z_t.float(), z_target.float())
+                    bcs_out = bcs(z_t.float(), z_targets[:, 0].float())
                     reg_loss = bcs_out["bcs_loss"]
                     vc_logs = {"bcs_loss": bcs_out["bcs_loss"].detach()}
                 else:
                     reg_loss, vc_logs = variance_covariance_loss(
-                        torch.cat([z_t, z_target], dim=0).float(),
+                        reg_input,
                         std_coeff=cfg.loss.get("std_coeff", 0.0),
                         cov_coeff=cfg.loss.get("cov_coeff", 0.0),
                     )
@@ -544,17 +573,24 @@ def validate(loader, encoder, music_encoder, predictor, cfg, device):
     encoder.eval()
     music_encoder.eval()
     predictor.eval()
+    H = cfg.data.get("pred_horizon", 1)
     losses = []
     for batch in loader:
-        x_t, x_next, music = unpack_batch(batch, cfg)
-        x_t = x_t.to(device, non_blocking=True)
-        x_next = x_next.to(device, non_blocking=True)
-        music = music.to(device, non_blocking=True)
-        z_t = cls_state(encoder, x_t)
+        x_t, x_futures, music = unpack_batch(batch, cfg)
+        x_t       = x_t.to(device, non_blocking=True)
+        x_futures = x_futures.to(device, non_blocking=True)
+        music     = music.to(device, non_blocking=True)
+        z_t       = cls_state(encoder, x_t)
         music_emb = encode_music(music_encoder, music, cfg)
-        z_pred = predictor(z_t, music_emb)
-    z_target = cls_state(encoder, x_next)
-    losses.append(F.smooth_l1_loss(z_pred, z_target).item())
+        z_targets = torch.stack([cls_state(encoder, x_futures[:, h]) for h in range(H)], dim=1)
+        state_seq = torch.cat([z_t.unsqueeze(1), z_targets[:, :-1]], dim=1)
+        if getattr(predictor, "is_rnn", False):
+            z_pred = torch.stack(
+                [predictor(state_seq[:, h], music_emb[:, h]) for h in range(H)], dim=1
+            )
+        else:
+            z_pred = predictor(state_seq, music_emb)
+        losses.append(F.smooth_l1_loss(z_pred, z_targets).item())
     mean_loss = sum(losses) / max(len(losses), 1)
     return {"val/pred_loss": mean_loss}
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -13,11 +12,7 @@ _PRETRAINED_DIR = Path(__file__).parent.parent.parent / "pretrained"
 
 
 class AttentionPooling(nn.Module):
-    """Weighted pooling over a sequence: learns which frames matter most.
-
-    Produces a single vector from [B, T, D] → [B, out_dim] via a softmax
-    over learned per-frame scalar scores, followed by a linear projection.
-    """
+    """Weighted pooling over a sequence: [B, T, D] → [B, out_dim]."""
 
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
@@ -25,7 +20,6 @@ class AttentionPooling(nn.Module):
         self.proj = nn.Linear(in_dim, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, D]
         weights = torch.softmax(self.score(x), dim=1)  # [B, T, 1]
         pooled = (weights * x).sum(dim=1)              # [B, D]
         return self.proj(pooled)                        # [B, out_dim]
@@ -34,12 +28,11 @@ class AttentionPooling(nn.Module):
 class AudioEncoder(nn.Module):
     """MuQ-based audio encoder for a single fixed-size chunk.
 
-    Expects input of exactly chunk_samples = chunk_frames * (sample_rate // fps)
-    samples. Returns one embedding vector per item in the batch.
+    Returns the full MuQ frame-level sequence — pooling is handled by the
+    downstream predictor so it can learn task-specific aggregation.
 
     Args:
         model_name: HuggingFace model ID for MuQ.
-        embed_dim: Output embedding dimension. If None, uses MuQ's hidden size.
         chunk_frames: Chunk duration in fps-rate frames (e.g. 150 = 5 s at 30 Hz).
         fps: Reference frame rate for chunk_frames.
         sample_rate: Input waveform sample rate (must match MuQ: 24 kHz).
@@ -48,7 +41,6 @@ class AudioEncoder(nn.Module):
     def __init__(
         self,
         model_name: str = "OpenMuQ/MuQ-large-msd-iter",
-        embed_dim: Optional[int] = 384,
         chunk_frames: int = 150,
         fps: int = 30,
         sample_rate: int = _MUQ_SAMPLE_RATE,
@@ -58,16 +50,12 @@ class AudioEncoder(nn.Module):
         self.sample_rate = sample_rate
         self.chunk_samples = chunk_frames * (sample_rate // fps)
 
-        # Load and freeze MuQ, caching weights in pretrained/
         self.muq: MuQ = MuQ.from_pretrained(model_name, cache_dir=_PRETRAINED_DIR)
         self.muq.eval()
         for p in self.muq.parameters():
             p.requires_grad_(False)
 
-        hidden_size = self.muq.config.encoder_dim
-        out_dim = embed_dim if embed_dim is not None else hidden_size
-        self.attn_pool = AttentionPooling(hidden_size, out_dim)
-        self._output_dim = out_dim
+        self._output_dim: int = self.muq.config.encoder_dim  # 1024 for MuQ-large
 
     @property
     def output_dim(self) -> int:
@@ -82,10 +70,9 @@ class AudioEncoder(nn.Module):
         """
         Args:
             x: [B, C, chunk_samples] raw audio at self.sample_rate.
-               Time dimension must equal self.chunk_samples exactly.
 
         Returns:
-            [B, output_dim]
+            [B, T, output_dim]  — full MuQ frame-level sequence.
         """
         B, C, T = x.shape
         if T != self.chunk_samples:
@@ -99,10 +86,7 @@ class AudioEncoder(nn.Module):
         with torch.no_grad():
             out = self.muq(x)
 
-        # Keep pooling in float32 — MuQ hidden states can have magnitudes that
-        # overflow float16 when cast down by an outer autocast context.
-        with torch.autocast(x.device.type, enabled=False):
-            return self.attn_pool(out.last_hidden_state.float())
+        return out.last_hidden_state.float()  # [B, T, output_dim]
 
 
 if __name__ == "__main__":
@@ -113,9 +97,8 @@ if __name__ == "__main__":
     print(f"total parameters   : {total:,}")
     print(f"trainable params   : {trainable:,}")
 
-    # Smoke test — one chunk of stereo audio
     B, C, T = 2, 2, encoder.chunk_samples
     x = torch.randn(B, C, T)
     out = encoder(x)
     print(f"\nsmoke test — input : {list(x.shape)}")
-    print(f"             output: {list(out.shape)}  (expected [{B}, {encoder.output_dim}])")
+    print(f"             output: {list(out.shape)}  (expected [{B}, T, {encoder.output_dim}])")

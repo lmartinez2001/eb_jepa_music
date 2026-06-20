@@ -10,9 +10,10 @@ data:
   loader: music.datasets.aistpp_v2.build_loaders
   batch_size: 128
   num_workers: 4
-  window: 75
-  horizon: 75   # = window → x_t and x_next are non-overlapping
-  stride: null  # null = non-overlapping between samples (stride = window)
+  window: 60
+  horizon: 60        # frame offset between consecutive prediction steps (= window → non-overlapping)
+  pred_horizon: 3    # number of future steps to predict; must match model.predictor.horizon
+  stride: null       # null = non-overlapping between samples (stride = window)
   data_root: /lustre/work/vivatech-4dudes/shared/datasets/aistpp_v3
   fps: 30
   sample_rate: 24000
@@ -25,11 +26,11 @@ model:
     dim_out: 3
     dim_feat: 512
     dim_rep: 512
-    depth: 5
+    depth: 8
     num_heads: 8
     mlp_ratio: 2
     num_joints: 25
-    maxlen: 75
+    maxlen: 60
     dropout: 0.0
     attn_dropout: 0.0
     drop_path: 0.0
@@ -40,21 +41,25 @@ model:
     # Set target to override, e.g. "my_pkg.my_module.build_music_encoder".
     target:
     model_name: OpenMuQ/MuQ-large-msd-iter
-    dim: 384
-    # MuQ itself is frozen inside AudioEncoder; false lets the small attention
-    # pooling/projection head train.
-    freeze: false
-    pool: mean
-    chunk_frames: 150
+    # dim: no longer controls AudioEncoder output (pooling moved to predictor).
+    # MuQ output dim is 1024; predictor's music_pool handles 1024 → predictor.dim.
+    freeze: true
+    chunk_frames: 120
     fps: 30
     sample_rate: 24000
 
   predictor:
-    num_layers: 1
+    target: transformer   # "rnn" for MusicRNNPredictor, "transformer" for MusicTransformerPredictor
+    num_layers: 4
     final_ln: true
+    dim: 512
+    num_heads: 8
+    ff_mult: 4
+    dropout: 0.0
+    horizon: 3            # must match data.pred_horizon
 
 loss:
-  type: sigreg   # "sigreg" (BCS / Epps-Pulley Gaussianity) or "vicreg" (hinge-std + covariance)
+  type: vicreg   # "sigreg" (BCS / Epps-Pulley Gaussianity) or "vicreg" (hinge-std + covariance)
   # SIGReg params (used when type: sigreg)
   bcs_coeff: 10.0
   bcs_slices: 256
@@ -78,7 +83,7 @@ logging:
   log_wandb: false
   wandb_group:
   wandb_sweep_id:
-  log_every: 100
+  log_every: 10
   val_every: 1
   save_every: 10
   tqdm_silent: false
@@ -91,8 +96,8 @@ sweep:
   param_grid:
     model.encoder.dim_feat: [256, 512]
     model.encoder.dim_rep: [512]
-    model.encoder.depth: [5]
-    model.predictor.num_layers: [1]
+    model.encoder.depth: [8]
+    model.predictor.num_layers: [4]
     loss.std_coeff: [4.0, 10.0]
     loss.cov_coeff: [0.1, 1.0]
     optim.lr: [0.00005, 0.0001, 0.0003]
