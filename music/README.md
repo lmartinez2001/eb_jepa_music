@@ -106,7 +106,7 @@ Config: `cfgs/train_decoder.yaml`. `data.cache_dir` must point at the directory 
 
 ---
 
-## Inference
+### 4 — Inference
 
 ```bash
 python music/infer.py \
@@ -117,11 +117,25 @@ python music/infer.py \
     --out          output/dance.npz
 ```
 
+The full pipeline runs in a single call:
+
+```
+audio → AudioEncoder → music_emb [1, H, T, 1024]
+init_pose (opt.) → DSTformer → z_t [1, 512]   (zeros if omitted)
+predictor.generate(z_t, music_emb)  → z_pred [1, H, 512]
+decoder.predict_motion(z_pred[:, h]) → poses_norm [1, 60, 25, 3]
+* std + mean (from normalizer.pt)    → poses_real
+concat H steps → [H×60, 25, 3]  saved as NPZ["poses"]
+```
+
 Optional flags:
 
 | flag | default | meaning |
 |---|---|---|
-| `--init-pose` | `None` | NPY file `[F, J, 3]` (unnormalised) to seed z_t |
-| `--num-steps` | 50 | Euler steps for flow-matching ODE |
+| `--init-pose` | `None` | NPY file `[F, J, 3]` (unnormalised) to seed `z_t` |
+| `--num-steps` | 50 | Euler steps for the flow-matching ODE (more → smoother, slower) |
+| `--device` | auto | `cuda` / `cpu` / `auto` |
+| `--jepa-config` | `music/cfgs/train.yaml` | override JEPA config path |
+| `--decoder-config` | `music/cfgs/train_decoder.yaml` | override decoder config path |
 
-Output: `dance.npz` with key `poses` of shape `[pred_horizon × window, 25, 3]` in real-world coordinates.
+Output: `dance.npz` with key `poses` of shape `[pred_horizon × window, 25, 3]` in real-world coordinates (unnormalised SMPL axis-angle + root translation).
