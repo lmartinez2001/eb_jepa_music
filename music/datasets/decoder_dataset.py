@@ -19,7 +19,9 @@ from music.main import (
     encode_music,
     unpack_batch,
 )
-from music.models.predictor import MusicRNNPredictor
+import torch.nn.functional as Fnn
+from music.models.transformer_predictor import MusicTransformerPredictor
+from music.models.rotation_utils import axis_angle_to_6d
 
 
 class CachedDecoderDataset(Dataset):
@@ -113,13 +115,18 @@ def build_loaders(
 def build_models(cfg, device: torch.device):
     encoder = build_keypoint_encoder(cfg).to(device)
     music_encoder = build_music_encoder(cfg).to(device)
-    predictor = MusicRNNPredictor(
+    p = cfg.model.predictor
+    final_ln = torch.nn.LayerNorm(cfg.model.encoder.dim_rep) if p.final_ln else None
+    predictor = MusicTransformerPredictor(
         state_dim=cfg.model.encoder.dim_rep,
-        music_dim=cfg.model.music_encoder.dim,
-        num_layers=cfg.model.predictor.num_layers,
-        final_ln=torch.nn.LayerNorm(cfg.model.encoder.dim_rep)
-        if cfg.model.predictor.final_ln
-        else None,
+        music_dim=music_encoder.output_dim,
+        horizon=p.get("horizon", 1),
+        dim=p.get("dim", 512),
+        num_layers=p.num_layers,
+        num_heads=p.get("num_heads", 8),
+        ff_mult=p.get("ff_mult", 4),
+        dropout=p.get("dropout", 0.0),
+        final_ln=final_ln,
     ).to(device)
     return encoder, music_encoder, predictor
 
@@ -173,6 +180,10 @@ def generate_split(
     music_encoder.eval()
     predictor.eval()
 
+    _ds = loader.dataset
+    norm_mean = torch.as_tensor(_ds.mean, device=device, dtype=torch.float32)  # [25,3]
+    norm_std = torch.as_tensor(_ds.std, device=device, dtype=torch.float32)
+
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16}
     dtype = dtype_map.get(cfg.training.get("dtype", "float16").lower(), torch.float16)
 
@@ -183,19 +194,26 @@ def generate_split(
     shard_id = 0
 
     for batch in tqdm(loader, desc=f"Generating {split} decoder cache"):
-        x_t, x_next, music = unpack_batch(batch, cfg)
+        x_t, x_futures, music = unpack_batch(batch, cfg)
         x_t = x_t.to(device, non_blocking=True)
-        x_next = x_next.to(device, non_blocking=True)
+        x_futures = x_futures.to(device, non_blocking=True)
         music = music.to(device, non_blocking=True)
 
         with autocast(device.type, enabled=use_amp, dtype=dtype):
-            z_t = cls_state(encoder, x_t)
-            music_emb = encode_music(music_encoder, music, cfg)
-            z_pred = predictor(z_t, music_emb)
+            z_t = cls_state(encoder, x_t)                        # [B, D]
+            music_emb = encode_music(music_encoder, music, cfg)  # [B, H, T, M]
+            z_pred = predictor.generate(z_t, music_emb)[:, 0]    # [B, D] (first 60-frame step)
 
-        poses_buffer.append(x_next.detach().cpu().float())
+        # pose target = first future window (h=0), converted to rot6d in float32
+        pose = x_futures[:, 0].float()                           # [B, window, 25, 3] normalized
+        raw = pose * norm_std + norm_mean                        # unnormalize
+        rot6 = axis_angle_to_6d(raw[..., :24, :])                # joints 0-23 -> [B,F,24,6]
+        trans6 = Fnn.pad(pose[..., 24:25, :], (0, 3))            # normalized trans padded -> [B,F,1,6]
+        poses6 = torch.cat([rot6, trans6], dim=-2)               # [B,F,25,6]
+
+        poses_buffer.append(poses6.detach().cpu().float())
         embedding_buffer.append(z_pred.detach().cpu().float())
-        buffered += x_next.shape[0]
+        buffered += poses6.shape[0]
 
         if buffered >= shard_size:
             shards.append(_save_shard(split_dir, shard_id, poses_buffer, embedding_buffer))
@@ -258,8 +276,11 @@ def generate_cache(args: argparse.Namespace) -> None:
         "horizon": cfg.data.horizon,
         "num_joints": cfg.model.encoder.num_joints,
         "embedding_dim": cfg.model.encoder.dim_rep,
+        "rep": "rot6d",
+        "pred_mode": "autoregressive_generate_h0",
+        "pred_horizon": cfg.data.get("pred_horizon", 1),
         "format": {
-            "poses": "[B, F, J, 3]",
+            "poses": "[B, F, 25, 6]",
             "embedding": "[B, embedding_dim]",
         },
     }

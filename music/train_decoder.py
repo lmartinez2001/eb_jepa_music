@@ -66,7 +66,7 @@ def validate(loader, decoder, device):
         loss, _ = decoder.compute_loss(x, z)
         losses.append(loss.item())
     mean_loss = sum(losses) / max(len(losses), 1)
-    return {"val/fm_loss": mean_loss}
+    return {"val/inference_mse": mean_loss}
 
 
 def run(
@@ -134,8 +134,11 @@ def run(
         num_heads=cfg.model.decoder.num_heads,
         mlp_ratio=cfg.model.decoder.mlp_ratio,
         t_dim=cfg.model.decoder.t_dim,
+        coord_dim=cfg.model.decoder.get("coord_dim", 3),
+        sigma_min=cfg.model.decoder.get("sigma_min", 1e-4),
     ).to(device)
 
+    
     optimizer = AdamW(
         decoder.parameters(),
         lr=cfg.optim.lr,

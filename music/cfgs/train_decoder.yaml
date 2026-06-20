@@ -12,22 +12,22 @@ data:
   #   embedding: [B, cond_dim]
   loader: music.datasets.decoder_dataset.build_loaders
   cache_dir: data/music_decoder_cache
-  batch_size: 64
+  batch_size: 16
   num_workers: 4
 
 model:
   decoder:
-    num_frames: 120
+    num_frames: 60
     num_joints: 25
     cond_dim: 512
-    dim: 512
-    depth: 6
+    dim: 384
+    depth: 4
     num_heads: 8
     mlp_ratio: 4.0
     t_dim: 256
 
 optim:
-  epochs: 100
+  epochs: 300
   lr: 0.0001
   weight_decay: 0.000001
   warmup_ratio: 0.1
