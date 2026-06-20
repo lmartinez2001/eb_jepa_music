@@ -17,15 +17,16 @@ data:
   data_root: /lustre/work/vivatech-4dudes/shared/datasets/aistpp_v3
   fps: 30
   sample_rate: 24000
-  audio_chunk_frames: 150
+  audio_chunk_frames: 120
   val_fraction: 0.1
 
 model:
+  ema_decay: 0.996   # EMA momentum for target encoder; higher = slower update = more stable targets
   encoder:
     dim_in: 3
     dim_out: 3
     dim_feat: 512
-    dim_rep: 512
+    dim_rep: 384
     depth: 8
     num_heads: 8
     mlp_ratio: 2
@@ -50,7 +51,7 @@ model:
 
   predictor:
     target: transformer   # "rnn" for MusicRNNPredictor, "transformer" for MusicTransformerPredictor
-    num_layers: 4
+    num_layers: 8
     final_ln: true
     dim: 512
     num_heads: 8
@@ -64,7 +65,7 @@ loss:
   bcs_coeff: 10.0
   bcs_slices: 256
   # VICReg params (used when type: vicreg)
-  std_coeff: 10.0
+  std_coeff: 5.0
   cov_coeff: 1.0
 
 optim:
@@ -85,7 +86,7 @@ logging:
   wandb_sweep_id:
   log_every: 10
   val_every: 1
-  save_every: 10
+  save_every: 2
   tqdm_silent: false
 
 # --- Parameters used when running with --full-sweep

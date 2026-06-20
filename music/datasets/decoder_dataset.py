@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import torch
+import torch.nn.functional as Fnn
 from omegaconf import OmegaConf
 from torch.amp import autocast
 from torch.utils.data import DataLoader, Dataset
@@ -19,7 +20,8 @@ from music.main import (
     encode_music,
     unpack_batch,
 )
-from music.models.predictor import MusicRNNPredictor
+from music.models.predictors import MusicRNNPredictor, MusicTransformerPredictor
+from music.models.rotation_utils import axis_angle_to_6d
 
 
 class CachedDecoderDataset(Dataset):
@@ -113,26 +115,52 @@ def build_loaders(
 def build_models(cfg, device: torch.device):
     encoder = build_keypoint_encoder(cfg).to(device)
     music_encoder = build_music_encoder(cfg).to(device)
-    predictor = MusicRNNPredictor(
-        state_dim=cfg.model.encoder.dim_rep,
-        music_dim=cfg.model.music_encoder.dim,
-        num_layers=cfg.model.predictor.num_layers,
-        final_ln=torch.nn.LayerNorm(cfg.model.encoder.dim_rep)
-        if cfg.model.predictor.final_ln
-        else None,
-    ).to(device)
-    return encoder, music_encoder, predictor
+
+    ema_encoder = build_keypoint_encoder(cfg).to(device)
+    ema_encoder.load_state_dict(encoder.state_dict())
+    for p in ema_encoder.parameters():
+        p.requires_grad_(False)
+    ema_encoder.eval()
+
+    _pred_cfg = cfg.model.predictor
+    _final_ln = torch.nn.LayerNorm(cfg.model.encoder.dim_rep) if _pred_cfg.final_ln else None
+    if _pred_cfg.get("target", "rnn") == "transformer":
+        predictor = MusicTransformerPredictor(
+            state_dim=cfg.model.encoder.dim_rep,
+            music_dim=music_encoder.output_dim,
+            horizon=_pred_cfg.get("horizon", 1),
+            dim=_pred_cfg.get("dim", 512),
+            num_layers=_pred_cfg.num_layers,
+            num_heads=_pred_cfg.get("num_heads", 8),
+            ff_mult=_pred_cfg.get("ff_mult", 4),
+            dropout=_pred_cfg.get("dropout", 0.0),
+            final_ln=_final_ln,
+        ).to(device)
+    else:
+        predictor = MusicRNNPredictor(
+            state_dim=cfg.model.encoder.dim_rep,
+            music_dim=cfg.model.music_encoder.dim,
+            num_layers=_pred_cfg.num_layers,
+            final_ln=_final_ln,
+        ).to(device)
+
+    return encoder, ema_encoder, music_encoder, predictor
 
 
 def load_jepa_checkpoint(
     checkpoint_path: str | Path,
     encoder: torch.nn.Module,
+    ema_encoder: torch.nn.Module,
     music_encoder: torch.nn.Module,
     predictor: torch.nn.Module,
     device: torch.device,
 ) -> None:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     encoder.load_state_dict(checkpoint["encoder"])
+    if "ema_encoder" in checkpoint:
+        ema_encoder.load_state_dict(checkpoint["ema_encoder"])
+    else:
+        ema_encoder.load_state_dict(checkpoint["encoder"])
     if "music_encoder" in checkpoint:
         music_encoder.load_state_dict(checkpoint["music_encoder"])
     predictor.load_state_dict(checkpoint["predictor"])
@@ -159,6 +187,7 @@ def generate_split(
     loader: DataLoader,
     out_dir: Path,
     encoder: torch.nn.Module,
+    ema_encoder: torch.nn.Module,
     music_encoder: torch.nn.Module,
     predictor: torch.nn.Module,
     cfg,
@@ -170,11 +199,18 @@ def generate_split(
     split_dir.mkdir(parents=True, exist_ok=True)
 
     encoder.eval()
+    ema_encoder.eval()
     music_encoder.eval()
     predictor.eval()
 
+    _ds = loader.dataset
+    norm_mean = torch.as_tensor(_ds.mean, device=device, dtype=torch.float32)  # [J, 3]
+    norm_std  = torch.as_tensor(_ds.std,  device=device, dtype=torch.float32)
+
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16}
     dtype = dtype_map.get(cfg.training.get("dtype", "float16").lower(), torch.float16)
+
+    H = cfg.data.get("pred_horizon", 1)
 
     shards = []
     poses_buffer = []
@@ -183,19 +219,33 @@ def generate_split(
     shard_id = 0
 
     for batch in tqdm(loader, desc=f"Generating {split} decoder cache"):
-        x_t, x_next, music = unpack_batch(batch, cfg)
+        x_t, x_futures, music = unpack_batch(batch, cfg)
+        # x_t       : [B, window, J, C]
+        # x_futures : [B, H, window, J, C]
+        # music     : [B, H, chunk_samples]
         x_t = x_t.to(device, non_blocking=True)
-        x_next = x_next.to(device, non_blocking=True)
-        music = music.to(device, non_blocking=True)
+        x_futures = x_futures.to(device, non_blocking=True)
 
         with autocast(device.type, enabled=use_amp, dtype=dtype):
-            z_t = cls_state(encoder, x_t)
-            music_emb = encode_music(music_encoder, music, cfg)
-            z_pred = predictor(z_t, music_emb)
+            # Use predictor outputs as embeddings — matches the inference pipeline exactly,
+            # where the decoder receives predictor outputs, not raw encoder embeddings.
+            z_t = cls_state(encoder, x_t)                         # [B, D]
+            music_emb = encode_music(music_encoder, music, cfg)   # [B, H, T, M]
+            z_targets = predictor.generate(z_t, music_emb)        # [B, H, D]
 
-        poses_buffer.append(x_next.detach().cpu().float())
-        embedding_buffer.append(z_pred.detach().cpu().float())
-        buffered += x_next.shape[0]
+        B = z_targets.shape[0]
+        # Only keep the last predicted step — maximum autoregressive context.
+        z_last = z_targets[:, -1]                                     # [B, D]
+        pose_norm = x_futures[:, -1].float()                          # [B, F, 25, 3] normalized
+        raw = pose_norm * norm_std + norm_mean                        # unnormalize
+        rot6   = axis_angle_to_6d(raw[..., :24, :])                  # [B, F, 24, 6]
+        trans6 = Fnn.pad(pose_norm[..., 24:25, :], (0, 3))           # [B, F,  1, 6]
+        poses_flat  = torch.cat([rot6, trans6], dim=-2)               # [B, F, 25, 6]
+        embeds_flat = z_last                                          # [B, D]
+
+        poses_buffer.append(poses_flat.detach().cpu().float())
+        embedding_buffer.append(embeds_flat.detach().cpu().float())
+        buffered += poses_flat.shape[0]
 
         if buffered >= shard_size:
             shards.append(_save_shard(split_dir, shard_id, poses_buffer, embedding_buffer))
@@ -222,14 +272,22 @@ def generate_cache(args: argparse.Namespace) -> None:
     setup_seed(cfg.meta.seed)
 
     train_loader, val_loader = build_source_dataloaders(cfg)
-    encoder, music_encoder, predictor = build_models(cfg, device)
-    load_jepa_checkpoint(args.checkpoint, encoder, music_encoder, predictor, device)
+    encoder, ema_encoder, music_encoder, predictor = build_models(cfg, device)
+    load_jepa_checkpoint(args.checkpoint, encoder, ema_encoder, music_encoder, predictor, device)
+
+    # Save the normalizer so inference can recover real-world coordinates.
+    # mean/std are computed from training clips only (inside build_loaders).
+    torch.save(
+        {"mean": train_loader.dataset.mean, "std": train_loader.dataset.std},
+        out_dir / "normalizer.pt",
+    )
 
     generate_split(
         "train",
         train_loader,
         out_dir,
         encoder,
+        ema_encoder,
         music_encoder,
         predictor,
         cfg,
@@ -243,6 +301,7 @@ def generate_cache(args: argparse.Namespace) -> None:
             val_loader,
             out_dir,
             encoder,
+            ema_encoder,
             music_encoder,
             predictor,
             cfg,
@@ -256,10 +315,13 @@ def generate_cache(args: argparse.Namespace) -> None:
         "checkpoint": str(args.checkpoint),
         "window": cfg.data.window,
         "horizon": cfg.data.horizon,
+        "pred_horizon": cfg.data.get("pred_horizon", 1),
         "num_joints": cfg.model.encoder.num_joints,
         "embedding_dim": cfg.model.encoder.dim_rep,
+        "rep": "rot6d",
+        "pred_mode": "predictor_generate_last_h",
         "format": {
-            "poses": "[B, F, J, 3]",
+            "poses": "[B, F, 25, 6]",
             "embedding": "[B, embedding_dim]",
         },
     }

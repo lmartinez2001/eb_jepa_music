@@ -352,6 +352,16 @@ def run(
     encoder = build_keypoint_encoder(cfg).to(device)
     music_encoder = build_music_encoder(cfg).to(device)
 
+    # EMA target encoder — same architecture, no gradients, updated via exponential moving average.
+    # Targets computed from this encoder move slowly and smoothly, avoiding the instability
+    # caused by the live encoder reorganising its representation space under VICReg pressure.
+    ema_decay = cfg.model.get("ema_decay", 0.996)
+    ema_encoder = build_keypoint_encoder(cfg).to(device)
+    ema_encoder.load_state_dict(encoder.state_dict())
+    for p in ema_encoder.parameters():
+        p.requires_grad_(False)
+    ema_encoder.eval()
+
     bcs = BCS(
         num_slices=cfg.loss.get("bcs_slices", 256),
         lmbd=cfg.loss.get("bcs_coeff", 10.0),
@@ -421,13 +431,17 @@ def run(
         predictor.load_state_dict(checkpoint["predictor"])
         if "music_encoder" in checkpoint:
             music_encoder.load_state_dict(checkpoint["music_encoder"])
+        if "ema_encoder" in checkpoint:
+            ema_encoder.load_state_dict(checkpoint["ema_encoder"])
+        else:
+            ema_encoder.load_state_dict(encoder.state_dict())
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_epoch = checkpoint.get("epoch", 0)
         global_step = checkpoint.get("step", 0)
 
     latest_ckpt_path = save_dir / "latest.pth.tar"
-    best_ckpt_path = save_dir / "best.pth.tar"
+    best_ckpt_path   = folder / "best.pth.tar"   # per-run, not shared across seeds/sweeps
     best_val_loss = float("inf")
 
     for epoch in range(start_epoch, cfg.optim.epochs):
@@ -459,7 +473,7 @@ def run(
 
                 with torch.no_grad():
                     z_targets = torch.stack(
-                        [cls_state(encoder, x_futures[:, h]) for h in range(H)], dim=1
+                        [cls_state(ema_encoder, x_futures[:, h]) for h in range(H)], dim=1
                     )  # [B, H, D]
 
                 # Teacher-forcing: state_seq = [z_t, z_{t+1}, ..., z_{t+H-1}]
@@ -477,6 +491,10 @@ def run(
                 reg_input = torch.cat(
                     [z_t, z_targets.flatten(0, 1)], dim=0
                 ).float()
+                # Ramp VICReg coefficients from 0 → full over the same warmup window as the LR.
+                # This prevents the regulariser from dominating before the predictor has
+                # warmed up, which is what causes the pred_loss spike around step ~400.
+                vicreg_ratio = min(1.0, global_step / max(scheduler.warmup_steps, 1))
                 loss_type = cfg.loss.get("type", "vicreg")
                 if loss_type == "sigreg":
                     bcs_out = bcs(z_t.float(), z_targets[:, 0].float())
@@ -485,8 +503,8 @@ def run(
                 else:
                     reg_loss, vc_logs = variance_covariance_loss(
                         reg_input,
-                        std_coeff=cfg.loss.get("std_coeff", 0.0),
-                        cov_coeff=cfg.loss.get("cov_coeff", 0.0),
+                        std_coeff=cfg.loss.get("std_coeff", 0.0) * vicreg_ratio,
+                        cov_coeff=cfg.loss.get("cov_coeff", 0.0) * vicreg_ratio,
                     )
                 loss = pred_loss + reg_loss
 
@@ -498,11 +516,16 @@ def run(
             scaler.update()
             scheduler.step()
 
+            with torch.no_grad():
+                for p_ema, p_online in zip(ema_encoder.parameters(), encoder.parameters()):
+                    p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
+
             global_step += 1
             last_logs = {
                 "loss": loss.detach(),
                 "pred_loss": pred_loss.detach(),
                 "reg_loss": reg_loss.detach(),
+                "vicreg_ratio": vicreg_ratio,
                 **vc_logs,
             }
             pbar.set_postfix(
@@ -522,7 +545,7 @@ def run(
 
         val_logs = {}
         if val_loader is not None and epoch % cfg.logging.get("val_every", 1) == 0:
-            val_logs = validate(val_loader, encoder, music_encoder, predictor, cfg, device)
+            val_logs = validate(val_loader, encoder, ema_encoder, music_encoder, predictor, cfg, device)
             collapse_logs = monitor_collapse(val_loader, encoder, cfg, device, folder, epoch, wandb_run)
             val_logs |= collapse_logs
             if wandb_run:
@@ -541,6 +564,7 @@ def run(
 
         ckpt_state = {
             "encoder": encoder.state_dict(),
+            "ema_encoder": ema_encoder.state_dict(),
             "music_encoder": music_encoder.state_dict(),
             "predictor": predictor.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -569,8 +593,9 @@ def run(
 
 
 @torch.no_grad()
-def validate(loader, encoder, music_encoder, predictor, cfg, device):
+def validate(loader, encoder, ema_encoder, music_encoder, predictor, cfg, device):
     encoder.eval()
+    ema_encoder.eval()
     music_encoder.eval()
     predictor.eval()
     H = cfg.data.get("pred_horizon", 1)
@@ -582,7 +607,7 @@ def validate(loader, encoder, music_encoder, predictor, cfg, device):
         music     = music.to(device, non_blocking=True)
         z_t       = cls_state(encoder, x_t)
         music_emb = encode_music(music_encoder, music, cfg)
-        z_targets = torch.stack([cls_state(encoder, x_futures[:, h]) for h in range(H)], dim=1)
+        z_targets = torch.stack([cls_state(ema_encoder, x_futures[:, h]) for h in range(H)], dim=1)
         state_seq = torch.cat([z_t.unsqueeze(1), z_targets[:, :-1]], dim=1)
         if getattr(predictor, "is_rnn", False):
             z_pred = torch.stack(

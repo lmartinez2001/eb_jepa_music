@@ -6,25 +6,27 @@ meta:
   load_checkpoint: latest.pth.tar
 
 data:
-  # Not implemented yet. This callable should return {"train": ..., "val": ...}.
-  # Each batch must contain:
-  #   poses:     [B, F, J, 3]
-  #   embedding: [B, cond_dim]
+  # Each batch contains:
+  #   poses:     [B, F, 25, 6]  rot6d — F = data.window (60); joints 0-23 as 6D rotation, joint 24 as padded translation
+  #   embedding: [B, cond_dim]  predictor output latent; cond_dim = model.encoder.dim_rep (384)
+  # Cache is generated with pred_horizon future steps flattened into individual samples.
   loader: music.datasets.decoder_dataset.build_loaders
   cache_dir: data/music_decoder_cache
-  batch_size: 64
-  num_workers: 4
+  batch_size: 128
+  num_workers: 0
 
 model:
   decoder:
-    num_frames: 120
+    num_frames: 60    # must match data.window in train.yaml
     num_joints: 25
-    cond_dim: 512
+    cond_dim: 384     # must match model.encoder.dim_rep in train.yaml
+    coord_dim: 6      # 6D rotation rep for joints 0-23, padded translation for joint 24
     dim: 512
     depth: 6
     num_heads: 8
     mlp_ratio: 4.0
     t_dim: 256
+    sigma_min: 0.0001
 
 optim:
   epochs: 100

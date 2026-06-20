@@ -177,51 +177,56 @@ class MotionDiT(nn.Module):
 
 
 class MotionDecoder(nn.Module):
-    """Flow Matching decoder that generates 3D keypoint clips from a latent z.
+    """Flow Matching decoder that generates motion clips from a latent z.
 
-    Training objective: Conditional Flow Matching with straight probability paths
-    (Lipman et al. 2022).  The model learns to predict the velocity field
-    v = x1 - x0 along the straight path from noise x0 to clean motion x1.
+    Training objective: x0-prediction CFM with sigma_min noise floor
+    (Lipman et al. 2022 / Albergo & Vanden-Eijnden 2023).  The model predicts
+    the clean sample x1 directly; inference uses the implied PF-ODE velocity.
 
-    Inference: Euler integration of dx/dt = v_theta(x_t, t, z) from t=0 to t=1.
+    Inference: Euler integration of the PF-ODE from t=0 to t=1.
     """
 
-    def __init__(self, dit: MotionDiT):
+    def __init__(self, dit: MotionDiT, sigma_min: float = 1e-4):
         super().__init__()
         self.dit = dit
+        self.sigma_min = sigma_min
+
+    @torch.no_grad()
+    def inference_loss(self, x1, z, num_steps: int = 50):
+        """End-to-end generation quality: full ODE sampling from noise, MSE vs GT."""
+        gen = self.predict_motion(z, num_frames=x1.shape[1], num_steps=num_steps)
+        loss = F.mse_loss(gen, x1)
+        return loss, {"inference_mse": loss.detach()}
 
     def compute_loss(
         self,
         x1: torch.Tensor,
         z: torch.Tensor,
     ) -> tuple[torch.Tensor, dict]:
-        """Conditional Flow Matching loss.
-
-        Samples a random interpolation time t ~ U(0,1) per batch element,
-        constructs the noisy sample x_t on the straight path from noise to data,
-        and regresses the velocity field v = x1 - x0.
+        """CFM loss with x0-prediction and sigma_min noise floor.
 
         Args:
-            x1: clean motion clips  [B, F, J, 3]
+            x1: clean motion clips  [B, F, J, C]
             z:  encoder latents     [B, cond_dim]
         Returns:
             (loss, log_dict)
         """
         B = x1.shape[0]
         device = x1.device
+        sigma = self.sigma_min
 
         x0 = torch.randn_like(x1)
         t = torch.rand(B, device=device)
-
-        # Straight-path interpolation: x_t = (1-t)*x0 + t*x1
         t_b = t.reshape(B, 1, 1, 1)
-        x_t = (1.0 - t_b) * x0 + t_b * x1    # [B, F, J, 3]
-        v_target = x1 - x0                     # [B, F, J, 3]  (constant along path)
 
-        v_pred = self.dit(x_t, t, z)
-        loss = F.mse_loss(v_pred, v_target)
+        # CFM path with sigma_min: x_t = t*x1 + (1-(1-sigma)*t)*noise
+        x_t = t_b * x1 + (1.0 - (1.0 - sigma) * t_b) * x0
 
-        return loss, {"fm_loss": loss.detach()}
+        # Model predicts the clean sample x1 (x0-prediction)
+        x1_pred = self.dit(x_t, t, z)
+        loss = F.mse_loss(x1_pred, x1)
+
+        return loss, {"mse": loss.detach()}
 
     @torch.no_grad()
     def predict_motion(
@@ -230,14 +235,14 @@ class MotionDecoder(nn.Module):
         num_frames: Optional[int] = None,
         num_steps: int = 50,
     ) -> torch.Tensor:
-        """Generate a motion clip from pure noise via Euler ODE integration.
+        """Generate a motion clip from pure noise via PF-ODE Euler integration.
 
         Args:
             z:          encoder latents  [B, cond_dim]
             num_frames: override F (default: dit.num_frames)
             num_steps:  number of Euler steps (more → smoother, slower)
         Returns:
-            generated motion  [B, F, J, 3]
+            generated motion  [B, F, J, C]
         """
         B = z.shape[0]
         F = num_frames or self.dit.num_frames
@@ -245,12 +250,17 @@ class MotionDecoder(nn.Module):
         C = self.dit.coord_dim
         device = z.device
 
+        sigma = self.sigma_min
         x = torch.randn(B, F, J, C, device=device)
         dt = 1.0 / num_steps
 
         for i in range(num_steps):
-            t = torch.full((B,), i * dt, device=device)
-            v = self.dit(x, t, z)
+            tval = i * dt
+            t = torch.full((B,), tval, device=device)
+            x1_hat = self.dit(x, t, z)                    # clean-sample prediction
+            denom = max(1.0 - (1.0 - sigma) * tval, 1e-6)
+            eps_hat = (x - tval * x1_hat) / denom         # implied noise
+            v = x1_hat - (1.0 - sigma) * eps_hat          # PF-ODE velocity
             x = x + v * dt
 
         return x
@@ -265,11 +275,13 @@ def build_motion_decoder(
     num_heads: int = 8,
     mlp_ratio: float = 4.0,
     t_dim: int = 256,
+    coord_dim: int = 6,
+    sigma_min: float = 1e-4,
 ) -> MotionDecoder:
     dit = MotionDiT(
         num_frames=num_frames,
         num_joints=num_joints,
-        coord_dim=3,
+        coord_dim=coord_dim,
         dim=dim,
         depth=depth,
         num_heads=num_heads,
@@ -277,7 +289,7 @@ def build_motion_decoder(
         cond_dim=cond_dim,
         t_dim=t_dim,
     )
-    return MotionDecoder(dit)
+    return MotionDecoder(dit, sigma_min=sigma_min)
 
 
 if __name__ == "__main__":
