@@ -99,7 +99,10 @@ class AudioEncoder(nn.Module):
         with torch.no_grad():
             out = self.muq(x)
 
-        return self.attn_pool(out.last_hidden_state)  # [B, output_dim]
+        # Keep pooling in float32 — MuQ hidden states can have magnitudes that
+        # overflow float16 when cast down by an outer autocast context.
+        with torch.autocast(x.device.type, enabled=False):
+            return self.attn_pool(out.last_hidden_state.float())
 
 
 if __name__ == "__main__":

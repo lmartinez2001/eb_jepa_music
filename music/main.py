@@ -1,3 +1,10 @@
+# `python music/main.py` puts music/ into sys.path[0], shadowing third-party
+# packages (e.g. HuggingFace `datasets` ← music/datasets/).  Strip it upfront.
+import sys as _sys, pathlib as _pathlib
+_here = _pathlib.Path(__file__).parent.resolve()
+_sys.path = [p for p in _sys.path if _pathlib.Path(p).resolve() != _here]
+del _sys, _pathlib, _here
+
 import importlib
 import os
 from pathlib import Path
@@ -5,6 +12,8 @@ from time import time
 from typing import Any
 
 import fire
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
@@ -14,6 +23,7 @@ from torch.optim import AdamW
 from tqdm import tqdm
 
 from eb_jepa.logging import get_logger
+from eb_jepa.losses import BCS
 from eb_jepa.schedulers import CosineWithWarmup
 from eb_jepa.training_utils import (
     get_default_dev_name,
@@ -175,6 +185,110 @@ def variance_covariance_loss(z, std_coeff=0.0, cov_coeff=0.0, eps=1e-4):
     return loss, {"std_loss": std_loss.detach(), "cov_loss": cov_loss.detach()}
 
 
+@torch.no_grad()
+def monitor_collapse(loader, encoder, cfg, device, folder: Path, epoch: int, wandb_run=None):
+    """Collect z_t embeddings from the val set and produce collapse diagnostics.
+
+    Saves three figures (per-dim std, PCA explained variance, 2D scatter) to
+    folder/collapse/ and logs them + effective_rank to W&B when available.
+    """
+    encoder.eval()
+    zs = []
+    for batch in loader:
+        x_t, _, _ = unpack_batch(batch, cfg)
+        x_t = x_t.to(device, non_blocking=True)
+        z = cls_state(encoder, x_t).float().cpu()
+        zs.append(z)
+        if len(zs) * z.shape[0] >= 2048:  # cap at 2048 samples for speed
+            break
+    Z = torch.cat(zs, dim=0).numpy()  # [N, D]
+    Zc = Z - Z.mean(0)                # centred
+
+    # --- effective rank (scale-invariant) -------------------------
+    # Uses entropy of normalised singular values (Roy & Vetterli 2007).
+    # Independent of the magnitude of Z — measures dimensionality of the cloud.
+    sv = np.linalg.svd(Zc, compute_uv=False)
+    sv_norm = sv / (sv.sum() + 1e-9)
+    entropy = -(sv_norm * np.log(sv_norm + 1e-9)).sum()
+    effective_rank = float(np.exp(entropy))
+
+    # --- raw per-dimension std (scale-sensitive) ------------------
+    # Near zero when the cloud is small in magnitude even if well-structured.
+    # Useful for checking that VICReg's std hinge (target ≥ 1) is satisfied.
+    raw_stds = Zc.std(axis=0)
+
+    # --- normalised per-dimension std (structure, scale-free) -----
+    # L2-normalise each sample so ||z_i||=1, then measure per-dim std.
+    # This isolates the *shape* of the cloud from its scale.
+    # Target: mean_std_norm ≈ 1/sqrt(D) ≈ 0.044 for D=512 when fully spread,
+    # and → 0 when collapsed to a single direction.
+    norms = np.linalg.norm(Z, axis=1, keepdims=True).clip(1e-9)
+    Znorm = Z / norms
+    norm_stds = Znorm.std(axis=0)
+
+    idx = np.argsort(raw_stds)[::-1]
+
+    # --- per-dim std bar chart ------------------------------------
+    fig_std, axes = plt.subplots(1, 2, figsize=(14, 3))
+    axes[0].bar(np.arange(len(raw_stds)), raw_stds[idx], width=1.0)
+    axes[0].set_xlabel("dimension (sorted by std)")
+    axes[0].set_ylabel("raw std")
+    axes[0].set_title(f"Raw per-dim std  (mean={raw_stds.mean():.3f}, min={raw_stds.min():.3f})")
+    axes[1].bar(np.arange(len(norm_stds)), norm_stds[np.argsort(norm_stds)[::-1]], width=1.0)
+    axes[1].axhline(1 / np.sqrt(Z.shape[1]), color="r", linestyle="--", label="uniform spread")
+    axes[1].set_xlabel("dimension (sorted by std)")
+    axes[1].set_ylabel("std on unit-sphere")
+    axes[1].set_title(f"Normalised per-dim std  (mean={norm_stds.mean():.4f}, min={norm_stds.min():.4f})")
+    axes[1].legend()
+    fig_std.suptitle(f"Epoch {epoch} — effective rank={effective_rank:.1f} / {Z.shape[1]}")
+    fig_std.tight_layout()
+
+    # --- PCA cumulative explained variance ------------------------
+    cumvar = np.cumsum(sv**2) / (np.sum(sv**2) + 1e-9)
+    fig_pca, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(np.arange(1, len(cumvar) + 1), cumvar)
+    ax.axhline(0.95, color="r", linestyle="--", label="95%")
+    ax.set_xlabel("number of PCA components")
+    ax.set_ylabel("cumulative explained variance")
+    ax.set_title(f"Epoch {epoch} — PCA explained variance")
+    ax.legend()
+    fig_pca.tight_layout()
+
+    # --- 2D PCA scatter -------------------------------------------
+    U, S, Vt = np.linalg.svd(Zc, full_matrices=False)
+    Z2 = Zc @ Vt[:2].T  # [N, 2]
+    fig_scatter, ax = plt.subplots(figsize=(5, 5))
+    ax.scatter(Z2[:, 0], Z2[:, 1], s=4, alpha=0.4)
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_title(f"Epoch {epoch} — 2D PCA scatter  (N={len(Z)})")
+    fig_scatter.tight_layout()
+
+    # --- save / log -----------------------------------------------
+    out_dir = folder / "collapse"
+    out_dir.mkdir(exist_ok=True)
+    fig_std.savefig(out_dir / f"std_epoch{epoch:04d}.png", dpi=100)
+    fig_pca.savefig(out_dir / f"pca_epoch{epoch:04d}.png", dpi=100)
+    fig_scatter.savefig(out_dir / f"scatter_epoch{epoch:04d}.png", dpi=100)
+    plt.close("all")
+
+    logs = {
+        "collapse/effective_rank": effective_rank,
+        "collapse/mean_std_raw": float(raw_stds.mean()),
+        "collapse/min_std_raw": float(raw_stds.min()),
+        "collapse/mean_std_norm": float(norm_stds.mean()),
+        "collapse/min_std_norm": float(norm_stds.min()),
+    }
+    if wandb_run:
+        wandb.log(logs | {
+            "collapse/std_chart": wandb.Image(str(out_dir / f"std_epoch{epoch:04d}.png")),
+            "collapse/pca_chart": wandb.Image(str(out_dir / f"pca_epoch{epoch:04d}.png")),
+            "collapse/scatter":   wandb.Image(str(out_dir / f"scatter_epoch{epoch:04d}.png")),
+        })
+
+    return logs
+
+
 def run(
     fname: str = "music/cfgs/train.yaml",
     cfg=None,
@@ -209,6 +323,8 @@ def run(
         folder_name = folder.name
         exp_name = folder_name.rsplit("_seed", 1)[0]
     os.makedirs(folder, exist_ok=True)
+    save_dir = Path(cfg.meta.save_dir) if cfg.meta.get("save_dir") else folder
+    save_dir.mkdir(parents=True, exist_ok=True)
 
     device = setup_device(cfg.meta.get("device", "auto"))
     setup_seed(cfg.meta.seed)
@@ -235,6 +351,11 @@ def run(
 
     encoder = build_keypoint_encoder(cfg).to(device)
     music_encoder = build_music_encoder(cfg).to(device)
+
+    bcs = BCS(
+        num_slices=cfg.loss.get("bcs_slices", 256),
+        lmbd=cfg.loss.get("bcs_coeff", 10.0),
+    ).to(device)
 
     predictor = MusicRNNPredictor(
         state_dim=cfg.model.encoder.dim_rep,
@@ -273,7 +394,7 @@ def run(
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16}
     dtype = dtype_map.get(cfg.training.get("dtype", "float16").lower(), torch.float16)
     use_amp = cfg.training.get("use_amp", True)
-    scaler = GradScaler(device.type, enabled=use_amp)
+    scaler = GradScaler(device.type, enabled=use_amp and dtype == torch.float16)
 
     start_epoch = 0
     global_step = 0
@@ -292,7 +413,9 @@ def run(
         start_epoch = checkpoint.get("epoch", 0)
         global_step = checkpoint.get("step", 0)
 
-    latest_ckpt_path = folder / "latest.pth.tar"
+    latest_ckpt_path = save_dir / "latest.pth.tar"
+    best_ckpt_path = save_dir / "best.pth.tar"
+    best_val_loss = float("inf")
 
     for epoch in range(start_epoch, cfg.optim.epochs):
         epoch_start = time()
@@ -325,12 +448,18 @@ def run(
                     z_target = cls_state(encoder, x_next)
 
                 pred_loss = F.smooth_l1_loss(z_pred, z_target)
-                vc_loss, vc_logs = variance_covariance_loss(
-                    torch.cat([z_t, z_target], dim=0).float(),
-                    std_coeff=cfg.loss.get("std_coeff", 0.0),
-                    cov_coeff=cfg.loss.get("cov_coeff", 0.0),
-                )
-                loss = pred_loss + vc_loss
+                loss_type = cfg.loss.get("type", "vicreg")
+                if loss_type == "sigreg":
+                    bcs_out = bcs(z_t.float(), z_target.float())
+                    reg_loss = bcs_out["bcs_loss"]
+                    vc_logs = {"bcs_loss": bcs_out["bcs_loss"].detach()}
+                else:
+                    reg_loss, vc_logs = variance_covariance_loss(
+                        torch.cat([z_t, z_target], dim=0).float(),
+                        std_coeff=cfg.loss.get("std_coeff", 0.0),
+                        cov_coeff=cfg.loss.get("cov_coeff", 0.0),
+                    )
+                loss = pred_loss + reg_loss
 
             scaler.scale(loss).backward()
             if cfg.optim.get("grad_clip"):
@@ -344,14 +473,14 @@ def run(
             last_logs = {
                 "loss": loss.detach(),
                 "pred_loss": pred_loss.detach(),
-                "vc_loss": vc_loss.detach(),
+                "reg_loss": reg_loss.detach(),
                 **vc_logs,
             }
             pbar.set_postfix(
                 {
                     "loss": f"{loss.item():.4f}",
                     "pred": f"{pred_loss.item():.4f}",
-                    "vc": f"{vc_loss.item():.4f}",
+                    "reg": f"{reg_loss.item():.4f}",
                 }
             )
 
@@ -365,6 +494,8 @@ def run(
         val_logs = {}
         if val_loader is not None and epoch % cfg.logging.get("val_every", 1) == 0:
             val_logs = validate(val_loader, encoder, music_encoder, predictor, cfg, device)
+            collapse_logs = monitor_collapse(val_loader, encoder, cfg, device, folder, epoch, wandb_run)
+            val_logs |= collapse_logs
             if wandb_run:
                 wandb.log(val_logs | {"global_step": global_step}, step=global_step)
 
@@ -379,35 +510,31 @@ def run(
             total_epochs=cfg.optim.epochs,
         )
 
-        torch.save(
-            {
-                "encoder": encoder.state_dict(),
-                "music_encoder": music_encoder.state_dict(),
-                "predictor": predictor.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "epoch": epoch + 1,
-                "step": global_step,
-            },
-            latest_ckpt_path,
-        )
+        ckpt_state = {
+            "encoder": encoder.state_dict(),
+            "music_encoder": music_encoder.state_dict(),
+            "predictor": predictor.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "epoch": epoch + 1,
+            "step": global_step,
+        }
+        torch.save(ckpt_state, latest_ckpt_path)
+
+        val_pred = val_logs.get("val/pred_loss")
+        if val_pred is not None and val_pred < best_val_loss:
+            best_val_loss = val_pred
+            torch.save(ckpt_state, best_ckpt_path)
+            logger.info(f"New best checkpoint at epoch {epoch} (val/pred_loss={val_pred:.4f})")
+
         if epoch % cfg.logging.get("save_every", 10) == 0 and epoch > 0:
-            torch.save(
-                {
-                    "encoder": encoder.state_dict(),
-                    "music_encoder": music_encoder.state_dict(),
-                    "predictor": predictor.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "epoch": epoch + 1,
-                    "step": global_step,
-                },
-                folder / f"epoch_{epoch}.pth.tar",
-            )
+            torch.save(ckpt_state, folder / f"epoch_{epoch}.pth.tar")
 
     return {
         "folder": str(folder),
+        "save_dir": str(save_dir),
         "latest_checkpoint": str(latest_ckpt_path),
+        "best_checkpoint": str(best_ckpt_path),
         "global_step": global_step,
     }
 

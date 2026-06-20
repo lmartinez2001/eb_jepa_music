@@ -2,17 +2,18 @@ meta:
   seed: 2025
   device: auto
   model_folder:
+  save_dir:             # explicit checkpoint dir; defaults to the experiment folder
   load_model: false
   load_checkpoint: latest.pth.tar
 
 data:
   loader: music.datasets.aistpp_v2.build_loaders
-  batch_size: 64
+  batch_size: 128
   num_workers: 4
   window: 75
   horizon: 75   # = window → x_t and x_next are non-overlapping
   stride: null  # null = non-overlapping between samples (stride = window)
-  data_root: /lustre/work/vivatech-4dudes/edugelay/datasets/aistpp_v2/data
+  data_root: /lustre/work/vivatech-4dudes/shared/datasets/aistpp_v3
   fps: 30
   sample_rate: 24000
   audio_chunk_frames: 150
@@ -53,6 +54,11 @@ model:
     final_ln: true
 
 loss:
+  type: sigreg   # "sigreg" (BCS / Epps-Pulley Gaussianity) or "vicreg" (hinge-std + covariance)
+  # SIGReg params (used when type: sigreg)
+  bcs_coeff: 10.0
+  bcs_slices: 256
+  # VICReg params (used when type: vicreg)
   std_coeff: 10.0
   cov_coeff: 1.0
 
@@ -65,7 +71,7 @@ optim:
 
 training:
   use_amp: true
-  dtype: float16
+  dtype: bfloat16
 
 logging:
   project: eb_jepa
@@ -83,8 +89,6 @@ logging:
 # without changing the MotionBERT tensor shape.
 sweep:
   param_grid:
-    data.batch_size: [32, 64]
-    data.horizon: [1, 4, 8]
     model.encoder.dim_feat: [256, 512]
     model.encoder.dim_rep: [512]
     model.encoder.depth: [5]
