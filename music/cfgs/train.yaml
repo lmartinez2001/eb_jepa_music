@@ -9,13 +9,13 @@ data:
   loader: music.datasets.aistpp_v2.build_loaders
   batch_size: 64
   num_workers: 4
-  window: 60
-  horizon: 60   # = window → x_t and x_next are non-overlapping
+  window: 75
+  horizon: 75   # = window → x_t and x_next are non-overlapping
   stride: null  # null = non-overlapping between samples (stride = window)
   data_root: /lustre/work/vivatech-4dudes/edugelay/datasets/aistpp_v2/data
   fps: 30
   sample_rate: 24000
-  audio_chunk_frames: 120
+  audio_chunk_frames: 150
   val_fraction: 0.1
 
 model:
@@ -44,8 +44,7 @@ model:
     # pooling/projection head train.
     freeze: false
     pool: mean
-    chunk_frames: 120
-    stride_frames: 15
+    chunk_frames: 150
     fps: 30
     sample_rate: 24000
 
